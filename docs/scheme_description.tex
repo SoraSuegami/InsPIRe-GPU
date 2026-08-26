@@ -1,0 +1,1432 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{mathtools}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{hyperref}
+\usepackage{cleveref}
+\usepackage{xcolor}
+\usepackage{caption}
+\usepackage{listings}
+\usepackage{multirow}
+
+\hypersetup{colorlinks=true, linkcolor=blue!70!black, citecolor=green!50!black, urlcolor=blue!60!black}
+
+\DeclareMathOperator{\Enc}{Enc}
+\DeclareMathOperator{\Dec}{Dec}
+\DeclareMathOperator{\GadgetDecomp}{G^{-1}}
+\DeclareMathOperator{\ExternalProd}{ExtProd}
+\DeclareMathOperator{\NTT}{NTT}
+\DeclareMathOperator{\INTT}{INTT}
+
+\newcommand{\Z}{\mathbb{Z}}
+\newcommand{\R}{\mathcal{R}}
+\newcommand{\Rq}{\R_{q}}
+\newcommand{\Rp}{\R_{p}}
+\newcommand{\norm}[1]{\left\lVert #1 \right\rVert_{\infty}}
+\newcommand{\floor}[1]{\left\lfloor #1 \right\rfloor}
+\newcommand{\ceil}[1]{\left\lceil #1 \right\rceil}
+\newcommand{\round}[1]{\left\lfloor #1 \right\rceil}
+\newcommand{\inner}[2]{\langle #1, #2 \rangle}
+
+\newtheorem{definition}{Definition}
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}{Lemma}
+\newtheorem{remark}{Remark}
+
+\lstset{basicstyle=\small\ttfamily, keywordstyle=\color{blue!70!black}, commentstyle=\color{green!50!black}, breaklines=true, frame=single, framerule=0.5pt, rulecolor=\color{gray!50}, backgroundcolor=\color{gray!5}}
+
+\title{\textbf{InsPIRe: Scheme Specification and Error Analysis}\\[6pt]
+\large Implementation Spec for \texttt{inspire-gpu} (C++/CUDA)}
+\author{Keewoo Lee}
+\date{May 2026}
+
+\begin{document}
+\maketitle
+
+%=============================================================================
+\section{Overview}\label{sec:overview}
+%=============================================================================
+
+This document is the implementation specification for the InsPIRe PIR scheme~\cite{inspire2025}, targeting a C++/CUDA library that runs on the GPU.
+All algorithms are given as pseudocode at implementation-ready detail.
+
+InsPIRe is a PIR protocol with three computational steps:
+\begin{enumerate}[nosep]
+    \item \textbf{Matrix--vector product:} selects the target row, producing scalar LWE intermediates.
+    \item \textbf{InspiRING ring packing:} converts $n$ scalar intermediates into one RLWE ciphertext.
+    \item \textbf{RGSW polynomial evaluation:} Horner's method with an RGSW query selects the target column group, reducing $D$ packed ciphertexts to one.
+\end{enumerate}
+The response consists of $c = \texttt{db\_cols}/(n \cdot D)$ compressed RLWE ciphertexts, each encrypting $n$ plaintext values.
+
+\texttt{inspire-gpu} implements this scheme in C++/CUDA on the GPU, using custom kernels for the matrix--vector product, NTT, gadget decomposition, ring packing collapse, and external products. Both RNS primes fit in 28~bits, so all device arithmetic uses 32-bit modular operations with Barrett reduction; 64-bit accumulators hold pre-reduction products.
+
+\Cref{sec:optimizations} tracks the optimizations introduced in this implementation relative to the reference Rust implementation~\cite{inspire2025}.
+
+\paragraph{Scope: univariate evaluation.}
+This document and the current \texttt{inspire-gpu} implementation describe a \emph{univariate} Horner evaluation in step~3: the column-group index is encoded along a single axis as a polynomial of degree $D - 1$ evaluated at one point $\omega^{j^*}$, requiring one RGSW ciphertext in the query.
+A \emph{multivariate} extension---factoring the column-group index into $r$ axes of degree $D^{1/r}$ and evaluating an $r$-variate polynomial via nested Horner with $r$ RGSWs---is a planned future direction.
+Multivariate evaluation reduces noise growth (multiplicative depth $r \cdot \log D^{1/r}$ vs.\ $\log D$ becomes irrelevant; what matters is the lower per-axis degree) and would raise $D_{\max}$, lowering precomputation memory at fixed database size.
+Extending the scheme would touch the index decomposition (\Cref{alg:query}), $\textsc{HornerEval}$ (\Cref{alg:horner}), the database encoding (\Cref{alg:inversedft} becomes a separable $r$-dimensional IDFT), and the noise bound (\Cref{sec:dmax}).
+
+%=============================================================================
+\section{Notation}\label{sec:notation}
+%=============================================================================
+
+\begin{table}[ht]\centering
+\caption{Notation conventions.}\label{tab:notation}
+\begin{tabular}{@{}cl@{}}
+\toprule
+\textbf{Symbol} & \textbf{Meaning} \\
+\midrule
+$n$       & Lattice dimension / polynomial degree (power of two) \\
+$N$       & Number of entries in the database \\
+$w$       & Size of each database entry in bytes \\
+$q = q_0 \cdot q_1$ & Ciphertext modulus (product of two NTT-friendly primes) \\
+$p$       & Plaintext modulus \\
+$\Delta = \floor{q/p}$ & Scale factor \\
+$\sigma$  & Discrete Gaussian standard deviation \\
+$\chi_{\mathrm{err}}$ & Error distribution: each coefficient i.i.d.\ from $D_{\mathbb{Z},\sigma}$ \\
+$\chi_{\mathrm{sk}}$  & Secret key distribution: uniform ternary $\{-1,0,+1\}$ per coefficient \\
+$d$       & Number of gadget digits; $d\!-\!1$ effective (approximate) \\
+$B$       & Gadget base \\
+$D$       & Interpolation degree \\
+$\Rq$     & Ring $\Z_q[X]/(X^n+1)$ \\
+$\Rp$     & Ring $\Z_p[X]/(X^n+1)$ \\
+$\tau_k$  & Automorphism: $\tau_k(f(X)) = f(X^k) \bmod (X^n+1)$ \\
+$[\cdot]_q$ & Reduction modulo $q$ to $(-q/2, q/2]$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%=============================================================================
+\section{Parameters}\label{sec:params}
+%=============================================================================
+
+\begin{table}[ht]\centering
+\caption{Scheme parameters.}\label{tab:params}
+\begin{tabular}{@{}lcl@{}}
+\toprule
+\textbf{Parameter} & \textbf{Symbol} & \textbf{Description} \\
+\midrule
+Lattice dimension     & $n$                    & Polynomial degree (power of two) \\
+Ciphertext modulus    & $q = q_0 \cdot q_1$    & Product of two NTT-friendly primes ($q_i \equiv 1 \pmod{2n}$) \\
+Plaintext modulus     & $p$                    & Odd; each coefficient encodes $\floor{\log_2 p}$ bits \\
+Scale factor          & $\Delta = \floor{q/p}$ & \\
+Noise std.\ dev.      & $\sigma$               & Discrete Gaussian \\
+Secret key dist.      & $\chi_{\mathrm{sk}}$   & Uniform ternary $\{-1,0,+1\}$ per coefficient \\
+Gadget digits         & $d$                    & Number of digits; $d\!-\!1$ effective (approximate) \\
+Gadget base           & $B = 2^{\ceil{\log_2 q / d}}$ & \\
+Interpolation degree  & $D$                    & Power of two; $D \le 2n$, bounded by noise budget (\Cref{sec:dmax}) \\
+\midrule
+\multicolumn{3}{@{}l@{}}{\emph{Response compression (modulus switching)}} \\
+\midrule
+$b$ modulus         & $q'_0$   & Bits per $b$ coefficient on wire \\
+$a$ modulus         & $q'_1$   & Bits per $a$ coefficient on wire \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The packing uses two families of automorphisms: forward ($\tau_{5^k}$) and conjugate ($\tau_{2n-5^k}$), where $5$ generates $(\Z/2n\Z)^*/\!\{\pm1\}$ of order $n/2$, and $\tau_{2n-1}: X \mapsto X^{-1}$ is the conjugation automorphism.
+Concrete parameter values are given in \Cref{sec:concrete}.
+
+\paragraph{Discrete Gaussian sampling.}\label{par:dg}
+We sample from the discrete Gaussian distribution $\chi_{\mathrm{err}}$: for integer $x$, $\Pr[X = x] \propto \exp(-x^2 / 2\sigma^2)$.
+
+\textbf{Implementation.}
+We use the \emph{cumulative distribution table} (CDT) method following OpenFHE: precompute the CDF of the discrete Gaussian for $|x| = 0, 1, \ldots, \round{6\sigma}$.
+To sample, draw a uniform random value and binary-search the table; the sign is determined by a random bit.
+
+%=============================================================================
+\section{Cryptographic Primitives}\label{sec:primitives}
+%=============================================================================
+
+%-----------------------------------------------------------------------------
+\subsection{Ring Arithmetic and NTT}\label{sec:ring}
+%-----------------------------------------------------------------------------
+
+All polynomial arithmetic is in $\Rq = \Z_q[X]/(X^n+1)$.
+Polynomials are arrays of $n$ integers in $[0, q)$.
+In RNS form, $q = q_0 \cdot q_1$; each polynomial is stored as two limbs of $n$ values (one per prime).
+All element-wise and NTT operations are performed independently per limb.
+
+\paragraph{Number Theoretic Transform.}
+Ring multiplication uses the NTT: $a(X) \cdot b(X) = \INTT(\NTT(a) \circ \NTT(b))$, where $\circ$ is coefficient-wise multiplication in the NTT domain.
+The NTT is a length-$n$ radix-2 Cooley--Tukey transform over $\Z_{q_c}$ using a primitive $2n$-th root of unity $\psi_c \in \Z_{q_c}$ (exists because $q_c \equiv 1 \pmod{2n}$).
+Specifically, the ``negacyclic NTT'' premultiplies by powers of $\psi_c$ to absorb the $X^n + 1$ reduction:
+\[
+    \hat{f}[i] = \sum_{j=0}^{n-1} f[j] \cdot \psi_c^{j} \cdot \omega_c^{ij} \pmod{q_c}, \qquad \omega_c = \psi_c^2
+\]
+where $\omega_c$ is a primitive $n$-th root of unity.
+The INTT inverts this with $n^{-1} \bmod q_c$ scaling.
+
+\paragraph{Representation convention.}
+Ciphertexts and keys are stored in \textbf{NTT form} by default (both limbs).
+Conversion to coefficient form (INTT) is performed only when needed: LWE extraction, gadget decomposition, automorphism application, and serialization.
+
+%-----------------------------------------------------------------------------
+\subsection{RLWE Encryption}\label{sec:rlwe}
+%-----------------------------------------------------------------------------
+
+\begin{algorithm}[H]
+\caption{$\textsc{SKGen}()$}
+\label{alg:skgen}
+\begin{algorithmic}[1]
+\State Sample $s \in \Rq$: each coefficient from $\chi_{\mathrm{sk}}$
+\State \Return $s$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{$\textsc{RLWE.Dec}(s, \mathsf{ct})$: Decrypt.}
+\label{alg:dec}
+\begin{algorithmic}[1]
+\State $(a, b) \gets \mathsf{ct}$
+\State $v(X) \gets [b(X) - a(X) \cdot s(X)]_q$ \Comment{centered reduction}
+\State \Return $\round{v(X) \cdot p / q} \bmod p$ \Comment{coefficient-wise}
+\end{algorithmic}
+\end{algorithm}
+
+%-----------------------------------------------------------------------------
+\subsection{LWE Structure}\label{sec:lwe-extract}
+%-----------------------------------------------------------------------------
+
+An RLWE ciphertext $(a(X), b(X))$ with $b(X) = a(X) \cdot s(X) + e(X) + \Delta \cdot m(X)$ implicitly contains $n$ scalar LWE ciphertexts, one per coefficient.
+The $b$-component of the $j$-th LWE ciphertext is simply $b[j]$ (the $j$-th coefficient of $b(X)$).
+The $a$-component is the $j$-th row of the \emph{negacyclic matrix} of $a(X)$ --- reconstructible from the seed by the server.
+
+\paragraph{Key observation:} $\textsc{LWE.Enc}_b$ (\Cref{alg:lwe-enc-b}) only needs to output the $b$-coefficients.
+No explicit LWE extraction is required on the client side.
+
+\begin{remark}[Correctness]\label{rem:extract}
+Write $v(X) = b(X) - a(X) \cdot s(X)$ in $\Rq$.
+The $j$-th coefficient of the product $a \cdot s$ (whose $j$-th coefficient is subtracted from $b[j]$) modulo $X^n+1$ is:
+\begin{equation}
+    (a \cdot s)_j = \sum_{k=0}^{j} a[j\!-\!k]\, s[k] \;-\; \sum_{k=j+1}^{n-1} a[n\!+\!j\!-\!k]\, s[k]
+    \label{eq:negacyclic-coeff}
+\end{equation}
+where the sign flip comes from $X^n \equiv -1$.
+This equals $\inner{\mathbf{a}_j}{\mathbf{s}}$ with the $\mathbf{a}_j$ above.
+Hence $v_j = \mathsf{ct}^{(b)}_j - \inner{\mathsf{ct}^{(a)}_j}{\mathbf{s}} = e_j + \Delta \cdot m_j$.
+\end{remark}
+
+\begin{remark}[Ring structure]\label{rem:ring-struct}
+The $n$ vectors $\{\mathbf{a}_j\}$ are rows of the \emph{negacyclic matrix} of $a(X)$:
+\begin{equation}
+    \mathbf{M}[j][k] = \begin{cases} a[j-k] & k \le j \\ -a[n+j-k] & k > j \end{cases}
+    \label{eq:negacyclic-matrix}
+\end{equation}
+This $n \times n$ matrix is fully determined by the single polynomial $a(X)$.
+When $a(X)$ is derived from a shared seed, the server can reconstruct all $\mathbf{a}$-vectors without any communication.
+This structure is exploited by InspiRING: because the $\mathbf{a}$-vectors of all $n$ LWE ciphertexts in one group share a single generating polynomial, the offline phase precomputes gadget decompositions of automorphisms of $a(X)$ from the seed alone.
+\end{remark}
+
+\begin{algorithm}[H]
+\caption{$\textsc{LWE.Enc}_b(s(X), i^*, \ell, \texttt{seed})$: Generate LWE $b$-values.}
+\label{alg:lwe-enc-b}
+\begin{algorithmic}[1]
+\State \textbf{Input:} Secret key $s(X)$; target index $i^* \in \{0, \ldots, \ell\!-\!1\}$; length $\ell$ (multiple of $n$); CRS seed
+\State \textbf{Output:} $\mathsf{ct}_{\mathrm{lwe}}^{(b)} \in \Z_q^{\ell}$ \Comment{vector of $\ell$ scalars}
+\State $n_r \gets \ell / n$
+\For{$r = 0, \ldots, n_r - 1$}
+    \State $a_r(X) \gets \mathsf{H}(\texttt{seed} \,\|\, \texttt{"rlwe"} \,\|\, r)$ \Comment{CRS}
+    \State $e_r(X) \gets \chi_{\mathrm{err}}$
+    \State $m_r(X) \gets \begin{cases} \Delta \cdot X^{i^* \bmod n} & \text{if } r = \floor{i^*/n} \\ 0 & \text{otherwise}\end{cases}$
+    \State $b_r(X) \gets a_r(X) \cdot s(X) + e_r(X) + m_r(X) \pmod{q}$
+    \State Append coefficients of $b_r(X)$ to $\mathsf{ct}_{\mathrm{lwe}}^{(b)}$
+\EndFor
+\State \Return $\mathsf{ct}_{\mathrm{lwe}}^{(b)}$
+\end{algorithmic}
+\end{algorithm}
+
+%-----------------------------------------------------------------------------
+\subsection{Approximate Gadget Decomposition}\label{sec:gadget}
+%-----------------------------------------------------------------------------
+
+\begin{algorithm}[H]
+\caption{$\textsc{Decomp}(f)$: Approximate centered gadget decomposition.}
+\label{alg:gadget}
+\begin{algorithmic}[1]
+\State \textbf{Input:} Polynomial $f \in \Rq$
+\State \textbf{Output:} Polynomials $\delta_1, \ldots, \delta_{d-1}$ with coefficients in $[-B/2, B/2)$
+\For{each coefficient $c$ of $f$} \Comment{independent per coefficient}
+    \State $r \gets c$
+    \For{$i = 0, \ldots, d-1$}
+        \State $\delta_i \gets r \bmod B$ \Comment{remainder in $[0, B)$}
+        \If{$\delta_i \ge B/2$} $\delta_i \gets \delta_i - B$; \quad $r \gets r + B$ \EndIf \Comment{center to $[-B/2, B/2)$}
+        \State $r \gets (r - \delta_i) / B$ \Comment{exact division; propagate carry}
+    \EndFor
+\EndFor
+\State \Return $(\delta_1, \ldots, \delta_{d-1})$ \Comment{drop $\delta_0$; residual $|\delta_0| \le B/2$ is negligible noise}
+\end{algorithmic}
+\end{algorithm}
+
+\textbf{Decomposition:} $f = \sum_{i=0}^{d-1} \delta_i \cdot B^i$ exactly (centered, with carries).
+Returned digits $\delta_1, \ldots, \delta_{d-1}$ satisfy $|\delta_i| \le B/2$ ($4\times$ noise reduction vs.\ non-centered $|\delta_i| < B$).
+Dropping $\delta_0$ saves one polynomial multiplication per use; the residual $|\delta_0| \le B/2 \approx 2^{17}$ is negligible vs.\ $\Delta/2 \approx 2^{37}$.
+
+%-----------------------------------------------------------------------------
+\subsection{Automorphism}\label{sec:auto}
+%-----------------------------------------------------------------------------
+
+The automorphism $\tau_k: \Rq \to \Rq$ substitutes $X \mapsto X^k$, i.e.:
+\[
+    \tau_k(f(X)) = f(X^k) \bmod (X^n + 1)
+\]
+Concretely, $\tau_5$ maps $s(X) \mapsto s(X^5)$, and $\tau_{2n-1}$ maps $s(X) \mapsto s(X^{-1})$.
+
+\begin{algorithm}[H]
+\caption{$\tau_k(f(X))$: Apply automorphism ($k$ odd, $\gcd(k, 2n) = 1$).}
+\label{alg:automorphism}
+\begin{algorithmic}[1]
+\State \textbf{Input:} $f(X) = \sum_j f_j X^j \in \Rq$
+\State \textbf{Output:} $\tau_k(f)(X) = f(X^k) \bmod (X^n+1)$
+\State Allocate $h[0 \mathinner{.\,.} n\!-\!1] \gets 0$
+\For{$j = 0, \ldots, n-1$}
+    \State $j' \gets j \cdot k \bmod 2n$
+    \If{$j' < n$} $h[j'] \gets h[j'] + f_j$
+    \Else{} $h[j' - n] \gets h[j' - n] - f_j$ \Comment{$X^n \equiv -1$}
+    \EndIf
+\EndFor
+\State \Return $h(X)$
+\end{algorithmic}
+\end{algorithm}
+
+%-----------------------------------------------------------------------------
+\subsection{Seed Expansion}\label{sec:seed}
+%-----------------------------------------------------------------------------
+
+All CRS-derived random polynomials use a deterministic hash:
+\begin{equation}
+    a_i(X) = \mathsf{H}(\texttt{seed} \,\|\, i) \in \Rq
+    \label{eq:seed-expand}
+\end{equation}
+where $\mathsf{H}: \{0,1\}^* \to \Rq$ expands to $n$ uniform values in $\Z_q$ by hashing with SHAKE-256 (or any XOF) in counter mode, reducing each output block modulo each RNS prime.
+The result is in \textbf{coefficient form}; the caller NTT-transforms as needed.
+The seed is a 64-byte ($\lambda = 512$~bit) value agreed between client and server.
+
+%-----------------------------------------------------------------------------
+\subsection{RGSW Encryption and External Product}\label{sec:rgsw}
+%-----------------------------------------------------------------------------
+
+An RGSW ciphertext of $\mu(X) \in \Rq$ under key $s(X)$ consists of $2(d\!-\!1)$ RLWE-like ciphertexts ($(d\!-\!1 = 2)$ effective digits).
+Each row is $(\mathsf{ct}^{(a)},\; \mathsf{ct}^{(b)}) = (a(X),\; a(X) \cdot s(X) + e(X) + \text{message})$ with \textbf{no $\Delta$ scaling}:
+\begin{equation}
+    \mathsf{RGSW}(\mu(X))^{(b)} =
+    \begin{pmatrix}
+        a^{(0)}_1(X) s(X) + e^{(0)}_1(X) - s(X) B^1 \mu(X) & \cdots \\
+        a^{(1)}_1(X) s(X) + e^{(1)}_1(X) + B^1 \mu(X) & \cdots
+    \end{pmatrix}
+    \label{eq:rgsw}
+\end{equation}
+The indices run from $1$ to $d-1$ (digit $0$ is dropped).
+The $a$-parts are CRS-derived; only the $b$-parts are transmitted.
+
+\begin{algorithm}[H]
+\caption{$\textsc{RGSW.Enc}_b(s(X),\; \mu(X),\; \texttt{seed})$: Generate RGSW $b$-parts.}
+\label{alg:rgsw-enc}
+\begin{algorithmic}[1]
+\State \textbf{Input:} Secret key $s(X)$; message $\mu(X) \in \Rq$; CRS seed
+\State \textbf{Output:} $\mathsf{ct}_{\mathrm{rgsw}}^{(b)}$: $2(d\!-\!1)$ polynomials in $\Rq$ (NTT form)
+\For{$j = 1, \ldots, d-1$} \Comment{$d\!-\!1$ effective digits}
+    \State $a_j^{(0)}(X) \gets \mathsf{H}(\texttt{seed} \,\|\, \texttt{"rgsw0"} \,\|\, j)$; \quad $e_j^{(0)}(X) \gets \chi_{\mathrm{err}}$ \Comment{CRS}
+    \State $a_j^{(1)}(X) \gets \mathsf{H}(\texttt{seed} \,\|\, \texttt{"rgsw1"} \,\|\, j)$; \quad $e_j^{(1)}(X) \gets \chi_{\mathrm{err}}$
+    \State $\mathsf{ct}_{\mathrm{rgsw}}^{(b)}[0][j] \gets a_j^{(0)}(X) \cdot s(X) + e_j^{(0)}(X) - s(X) \cdot B^j \cdot \mu(X) \pmod{q}$ \Comment{top row; no $\Delta$}
+    \State $\mathsf{ct}_{\mathrm{rgsw}}^{(b)}[1][j] \gets a_j^{(1)}(X) \cdot s(X) + e_j^{(1)}(X) + B^j \cdot \mu(X) \pmod{q}$ \Comment{bottom row}
+\EndFor
+\State \Return $\mathsf{ct}_{\mathrm{rgsw}}^{(b)}$
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{RGSW query monomial.}
+For the second-dimension query targeting evaluation index $j^*$, the message is $\mu(X) = X^{j^* \cdot n/D}$, the evaluation point $\omega^{j^*}$ where $\omega(X) = X^{n/D}$ is the $D$-th root of unity in $\Rp$.
+The Horner evaluation at this point selects the $j^*$-th interpolation slice.
+
+\begin{algorithm}[H]
+\caption{$\ExternalProd(\mathsf{RGSW}(\mu),\; \mathsf{ct})$: RGSW $\times$ RLWE (approximate).}
+\label{alg:extprod}
+\begin{algorithmic}[1]
+\State \textbf{Input:} $\mathsf{RGSW}(\mu)$ ($2(d\!-\!1)$ RLWE cts); $\mathsf{ct} = (a(X), b(X))$
+\State \textbf{Output:} RLWE ciphertext encrypting $\mu(X) \cdot m(X)$
+\State $(\delta_1^{(a)}, \ldots, \delta_{d-1}^{(a)}) \gets \textsc{Decomp}(a(X))$ \Comment{\Cref{alg:gadget}}
+\State $(\delta_1^{(b)}, \ldots, \delta_{d-1}^{(b)}) \gets \textsc{Decomp}(b(X))$ \Comment{\Cref{alg:gadget}}
+\State $\mathsf{resp} \gets \sum_{j=1}^{d-1} \delta_j^{(a)} \cdot \mathsf{RGSW}[0][j] + \sum_{j=1}^{d-1} \delta_j^{(b)} \cdot \mathsf{RGSW}[1][j]$ \Comment{$2(d\!-\!1)$ poly mults}
+\State \Return $\mathsf{resp}$
+\end{algorithmic}
+\end{algorithm}
+
+%=============================================================================
+\section{InspiRING Packing}\label{sec:packing}
+%=============================================================================
+
+InspiRING packs $n$ scalar $b$-values into one RLWE ciphertext.
+There are three entry points:
+\begin{itemize}[nosep]
+    \item $\textsc{KskGen}_b$ (client): generate $b$-parts of two key-switching keys.
+    \item $\textsc{InspiRINGOffline}$ (server, offline): precompute $a$-path aggregates and collapse.
+    \item $\textsc{InspiRINGOnline}$ (server, online): $b$-side collapse.
+\end{itemize}
+
+%-----------------------------------------------------------------------------
+\subsection{Key-Switching Key Generation}\label{sec:packing-keys}
+%-----------------------------------------------------------------------------
+
+A key-switching key for index $k$ enables the server to switch from $s(X^k)$ to $s(X)$.
+Each key has an $a$-part (from CRS) and a $b$-part (query-dependent, transmitted).
+
+\paragraph{$a$-part (CRS-derived, server-side).}
+\begin{equation}
+    \mathsf{ksk}_k^{(a)}[j] = \mathsf{H}(\texttt{seed} \,\|\, \texttt{"ksk"} \,\|\, k \,\|\, j), \qquad j = 1, \ldots, d-1
+    \label{eq:ksk-a}
+\end{equation}
+
+\paragraph{$b$-part (client-generated, transmitted).}
+\begin{algorithm}[H]
+\caption{$\textsc{KskGen}_b(s(X), k, \texttt{seed})$: Generate key-switching key $b$-part.}
+\label{alg:ksk-gen}
+\begin{algorithmic}[1]
+\State \textbf{Input:} Secret key $s(X)$; automorphism index $k$; CRS seed
+\State \textbf{Output:} $\mathsf{ksk}_k^{(b)}$: $d\!-\!1$ polynomials in $\Rq$ (NTT form)
+\For{$j = 1, \ldots, d-1$} \Comment{$d\!-\!1$ rows (approximate gadget)}
+    \State $a_j(X) \gets \mathsf{H}(\texttt{seed} \,\|\, \texttt{"ksk"} \,\|\, k \,\|\, j)$ \Comment{CRS}
+    \State $e_j(X) \gets \chi_{\mathrm{err}}$
+    \State $\mathsf{ksk}_k^{(b)}[j](X) \gets a_j(X) \cdot s(X) + e_j(X) + s(X^k) \cdot B^j \pmod{q}$ \Comment{$s(X^k) = \tau_k(s(X))$}
+\EndFor
+\State \Return $\mathsf{ksk}_k^{(b)}$ \Comment{$d\!-\!1$ polynomials}
+\end{algorithmic}
+\end{algorithm}
+
+Two key-switching keys are needed:
+$\mathsf{ksk}_5$ for rotation ($s(X) \to s(X^5)$), and
+$\mathsf{ksk}_{-1}$ for conjugation ($s(X) \to s(X^{-1})$).
+On the wire: $2(d\!-\!1)$ polynomials ($b$-parts only).
+
+%-----------------------------------------------------------------------------
+\subsection{Offline Phase}\label{sec:packing-offline}
+%-----------------------------------------------------------------------------
+
+\begin{algorithm}[H]
+\caption{$\textsc{InspiRINGOffline}(\mathbf{a}_0, \ldots, \mathbf{a}_{n-1},\; \texttt{seed})$}
+\label{alg:pack-offline}
+\begin{algorithmic}[1]
+\State \textbf{Input:} $n$ LWE $a$-vectors $\mathbf{a}_j \in \Z_q^n$; CRS seed
+\State \textbf{Output:} $\mathsf{precomp} = \{a(X),\; \mathbf{D}_{+},\; \mathbf{D}_{-},\; \mathbf{D}_{\mathrm{final}}\}$
+\Statex
+\State $\bigl(\mathsf{K}_{+}^{(a)},\; \mathsf{K}_{-}^{(a)},\; \mathsf{ksk}_{-1}^{(a)}\bigr) \gets \textsc{ExpandKSK}_a(\texttt{seed})$ \Comment{\Cref{alg:expand-ksk-a}}
+\State $\hat{\mathbf{a}}_{\mathrm{agg}}(X) \gets \textsc{RingEmbed}(\mathbf{a}_0, \ldots, \mathbf{a}_{n-1})$ \Comment{\Cref{alg:ring-embed}}
+\State $\bigl(a(X),\; \mathbf{D}_{+},\; \mathbf{D}_{-},\; \mathbf{D}_{\mathrm{final}}\bigr) \gets \textsc{CollapseA}\bigl(\hat{\mathbf{a}}_{\mathrm{agg}}(X),\; \mathsf{K}_{+}^{(a)},\; \mathsf{K}_{-}^{(a)},\; \mathsf{ksk}_{-1}^{(a)}\bigr)$ \Comment{\Cref{alg:collapse-a}}
+\State \Return $\mathsf{precomp} = \{a(X),\; \mathbf{D}_{+},\; \mathbf{D}_{-},\; \mathbf{D}_{\mathrm{final}}\}$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{remark}[Amortizing $\textsc{ExpandKSK}_a$]
+$\textsc{ExpandKSK}_a$ (\Cref{alg:expand-ksk-a} below) depends only on the CRS seed, so its output is identical across every $\textsc{InspiRINGOffline}$ call.
+In practice, expand once, store $(\mathsf{K}_{+}^{(a)},\, \mathsf{K}_{-}^{(a)},\, \mathsf{ksk}_{-1}^{(a)})$, and reuse it across multiple invocations to amortize the cost.
+\end{remark}
+
+\begin{algorithm}[H]
+\caption{$\textsc{ExpandKSK}_a(\texttt{seed})$: Derive and expand KSK $a$-parts from seed.}
+\label{alg:expand-ksk-a}
+\begin{algorithmic}[1]
+\State \textbf{Input:} CRS seed
+\State \textbf{Output:} $\mathsf{K}_{+}^{(a)},\; \mathsf{K}_{-}^{(a)},\; \mathsf{ksk}_{-1}^{(a)}$
+\Statex
+\For{$j = 1, \ldots, d - 1$} \Comment{derive $\mathsf{ksk}_5$ $a$-parts from seed via~\eqref{eq:ksk-a}}
+    \State $\mathsf{ksk}_5^{(a)}[j](X) \gets \mathsf{H}(\texttt{seed} \,\|\, \texttt{"ksk"} \,\|\, 5 \,\|\, j)$
+    \State $\mathsf{ksk}_{-1}^{(a)}[j](X) \gets \mathsf{H}(\texttt{seed} \,\|\, \texttt{"ksk"} \,\|\, (2n\!-\!1) \,\|\, j)$
+\EndFor
+\Statex
+\For{$k = 0, \ldots, n/2 - 2$} \Comment{both caches automorph the same $\mathsf{ksk}_5$}
+    \For{$j = 1, \ldots, d - 1$}
+        \State $\mathsf{K}_{+}^{(a)}[k][j](X) \gets \tau_{5^k}\!\bigl(\mathsf{ksk}_5^{(a)}[j](X)\bigr)$ \Comment{switches $s(X^{5^{k+1}}) \to s(X^{5^k})$}
+        \State $\mathsf{K}_{-}^{(a)}[k][j](X) \gets \tau_{2n-5^k}\!\bigl(\mathsf{ksk}_5^{(a)}[j](X)\bigr)$ \Comment{switches $s(X^{-5^{k+1}}) \to s(X^{-5^k})$}
+    \EndFor
+\EndFor
+\State \Return $\bigl(\mathsf{K}_{+}^{(a)},\; \mathsf{K}_{-}^{(a)},\; \mathsf{ksk}_{-1}^{(a)}\bigr)$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{$\textsc{RingEmbed}(\mathbf{a}_0, \ldots, \mathbf{a}_{n-1})$: Embed and aggregate $n$ LWE $a$-vectors.}
+\label{alg:ring-embed}
+\begin{algorithmic}[1]
+\State \textbf{Input:} $n$ LWE $a$-vectors $\mathbf{a}_j \in \Z_q^n$
+\State \textbf{Output:} $n$ aggregate polynomials $\hat{\mathbf{a}}_{\mathrm{agg}}[0](X), \ldots, \hat{\mathbf{a}}_{\mathrm{agg}}[n\!-\!1](X)$
+\Statex
+\State \Comment{\textbf{Transform} (following Algorithm~1 of~\cite{inspire2025})}
+\For{$j = 0, \ldots, n-1$}
+    \State $\tilde{a}_j(X) \gets n^{-1} \sum_{i=0}^{n-1} \mathbf{a}_j[i] \cdot X^{-i}$ \Comment{$n \cdot n^{-1} = 1 \pmod{q}$; $X^{-i} = -X^{n-i}$}
+    \For{$k = 0, \ldots, n/2 - 1$}
+        \State $\hat{\mathbf{a}}_j[k](X) \gets \tau_{5^k}\!\bigl(\tilde{a}_j(X)\bigr)$ \Comment{forward}
+        \State $\hat{\mathbf{a}}_j[k + n/2](X) \gets \tau_{2n-5^k}\!\bigl(\tilde{a}_j(X)\bigr)$ \Comment{conjugate}
+    \EndFor
+\EndFor
+\Statex
+\State \Comment{\textbf{Aggregate} (shift by $X^j$ and sum)}
+\For{$k = 0, \ldots, n - 1$}
+    \State $\hat{\mathbf{a}}_{\mathrm{agg}}[k](X) \gets \sum_{j=0}^{n-1} \hat{\mathbf{a}}_j[k](X) \cdot X^j$
+\EndFor
+\State \Return $\hat{\mathbf{a}}_{\mathrm{agg}}(X)$ \Comment{vector of $n$ polynomials}
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{$\textsc{CollapseA}(\hat{\mathbf{a}}_{\mathrm{agg}}(X),\; \mathsf{K}_{+}^{(a)},\; \mathsf{K}_{-}^{(a)},\; \mathsf{ksk}_{-1}^{(a)})$: Full $a$-side Collapse.}
+\label{alg:collapse-a}
+\begin{algorithmic}[1]
+\State \textbf{Input:} $n$ aggregate polynomials $\hat{\mathbf{a}}_{\mathrm{agg}}(X)$; expanded keys $\mathsf{K}_{+}^{(a)},\; \mathsf{K}_{-}^{(a)}$ from \Cref{alg:expand-ksk-a}; raw $\mathsf{ksk}_{-1}^{(a)}$
+\State \textbf{Output:} $a(X)$; gadget digit vectors $\mathbf{D}_{+},\; \mathbf{D}_{-},\; \mathbf{D}_{\mathrm{final}}$
+\Statex
+\State \Comment{\textbf{CollapseHalf} ($+$ direction): reduce $\hat{\mathbf{a}}_{\mathrm{agg}}[0 \!:\! n/2]$ under $s(X^{5^k}) \to s(X)$}
+\For{$k = n/2 - 1$ \textbf{down to} $1$}
+    \State $\mathbf{D}_{+}[k] \gets \textsc{Decomp}\!\bigl(\hat{\mathbf{a}}_{\mathrm{agg}}[k](X)\bigr)$
+    \For{$j = 1, \ldots, d - 1$}
+        \State $\hat{\mathbf{a}}_{\mathrm{agg}}[k\!-\!1](X) \mathrel{-}= \mathbf{D}_{+}[k][j](X) \cdot \mathsf{K}_{+}[k\!-\!1][j](X)$
+    \EndFor
+\EndFor
+\Statex
+\State \Comment{\textbf{CollapseHalf} ($-$ direction): reduce $\hat{\mathbf{a}}_{\mathrm{agg}}[n/2 \!:\! n]$ under $s(X^{-5^k}) \to s(X^{-1})$}
+\For{$k = n/2 - 1$ \textbf{down to} $1$}
+    \State $\mathbf{D}_{-}[k] \gets \textsc{Decomp}\!\bigl(\hat{\mathbf{a}}_{\mathrm{agg}}[n/2 + k](X)\bigr)$
+    \For{$j = 1, \ldots, d - 1$}
+        \State $\hat{\mathbf{a}}_{\mathrm{agg}}[n/2 + k\!-\!1](X) \mathrel{-}= \mathbf{D}_{-}[k][j](X) \cdot \mathsf{K}_{-}[k\!-\!1][j](X)$
+    \EndFor
+\EndFor
+\Statex
+\State \Comment{\textbf{Final CollapseOne}: key-switch $\hat{\mathbf{a}}_{\mathrm{agg}}[n/2]$ from $s(X^{-1})$ to $s(X)$}
+\State $\mathbf{D}_{\mathrm{final}} \gets \textsc{Decomp}\!\bigl(\hat{\mathbf{a}}_{\mathrm{agg}}[n/2](X)\bigr)$
+\State $a(X) \gets \hat{\mathbf{a}}_{\mathrm{agg}}[0](X) - \sum_{j=1}^{d-1} \mathbf{D}_{\mathrm{final}}[j](X) \cdot \mathsf{ksk}_{-1}^{(a)}[j](X)$
+\State \Return $\bigl(a(X),\; \mathbf{D}_{+},\; \mathbf{D}_{-},\; \mathbf{D}_{\mathrm{final}}\bigr)$
+\end{algorithmic}
+\end{algorithm}
+
+\textbf{Offline cost per group:}
+$n^2$ automorphisms + $n^2$ polynomial multiply-accumulates ($\textsc{RingEmbed}$) + $2(n/2 - 1) + 1$ gadget decompositions + $(2(n/2 - 1) + 1)(d\!-\!1)$ multiply-accumulates ($\textsc{CollapseA}$).
+In the reference implementation, $\textsc{RingEmbed}$ is fused into a single pass per share, giving $O(n^2)$ NTT multiply-accumulates total.
+
+\paragraph{Implementing automorphisms.}
+The Galois automorphism $\tau_t : f(X) \to f(X^t)$ in $\Rq = \Z_q[X]/(X^n+1)$ is a coefficient-domain index permutation with sign flips.
+For $f(X) = \sum_{i} c_i X^i$, the result $g = \tau_t(f)$ has:
+\[
+    g[(i \cdot t) \bmod n] \mathrel{+}=
+    \begin{cases}
+        +c_i & \text{if } \lfloor i \cdot t / n \rfloor \text{ is even,} \\
+        -c_i & \text{if } \lfloor i \cdot t / n \rfloor \text{ is odd}
+    \end{cases}
+\]
+(the sign flip arises from the negacyclic reduction $X^n \equiv -1$).
+In our setting, the forward automorphisms use powers $5^0, 5^1, \ldots, 5^{n/2-1} \pmod{2n}$, and the conjugate automorphisms use $2n - 5^0, 2n - 5^1, \ldots, 2n - 5^{n/2-1}$.
+The conjugation automorphism $\tau_{2n-1}$ maps $X \to X^{-1}$.
+
+%-----------------------------------------------------------------------------
+\subsection{Online Phase}\label{sec:packing-online}
+%-----------------------------------------------------------------------------
+
+The online phase uses $\mathbf{D}_{+},\; \mathbf{D}_{-},\; \mathbf{D}_{\mathrm{final}}$ from the offline phase and the client's key-switching key $b$-parts.
+$\textsc{ExpandKSK}_b$ is called once; the expanded keys can be reused to ring-pack multiple groups of LWE ciphertexts.
+
+\begin{algorithm}[H]
+\caption{$\textsc{ExpandKSK}_b(\mathsf{ksk}_5^{(b)})$: Expand KSK $b$-parts.}
+\label{alg:expand-ksk}
+\begin{algorithmic}[1]
+\State \textbf{Input:} $b$-part $\mathsf{ksk}_5^{(b)}$ ($d\!-\!1$ polynomials in $\Rq$)
+\State \textbf{Output:} Expanded $b$-part caches $\mathsf{K}_{+}^{(b)},\; \mathsf{K}_{-}^{(b)}$
+\Statex
+\For{$k = 0, \ldots, n/2 - 2$} \Comment{both caches automorph the same $\mathsf{ksk}_5^{(b)}$}
+    \For{$j = 1, \ldots, d - 1$}
+        \State $\mathsf{K}_{+}^{(b)}[k][j](X) \gets \tau_{5^k}\!\bigl(\mathsf{ksk}_5^{(b)}[j](X)\bigr)$
+        \State $\mathsf{K}_{-}^{(b)}[k][j](X) \gets \tau_{2n-5^k}\!\bigl(\mathsf{ksk}_5^{(b)}[j](X)\bigr)$
+    \EndFor
+\EndFor
+\State \Return $\bigl(\mathsf{K}_{+}^{(b)},\; \mathsf{K}_{-}^{(b)}\bigr)$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{$\textsc{InspiRINGOnline}(\mathsf{precomp},\; \mathsf{K}_{+}^{(b)},\; \mathsf{K}_{-}^{(b)},\; \mathsf{ksk}_{-1}^{(b)},\; b_0, \ldots, b_{n-1})$: Pack one group.}
+\label{alg:pack-online}
+\begin{algorithmic}[1]
+\State \textbf{Input:} $\mathsf{precomp}$ from \Cref{alg:pack-offline}; $\mathsf{K}_{+}^{(b)},\; \mathsf{K}_{-}^{(b)}$ from \Cref{alg:expand-ksk}; raw $\mathsf{ksk}_{-1}^{(b)}$; $n$ scalars $b_j \in \Z_q$
+\State \textbf{Output:} RLWE ciphertext $\bigl(a(X),\; b(X)\bigr)$
+\Statex
+\State Parse $\mathsf{precomp} = \{a(X),\; \mathbf{D}_{+},\; \mathbf{D}_{-},\; \mathbf{D}_{\mathrm{final}}\}$
+\State $b(X) \gets \sum_{j=0}^{n-1} b_j \cdot X^j$ \Comment{embed $b$-scalars into polynomial}
+\Statex
+\State \Comment{\textbf{CollapseHalf} ($+$ direction)}
+\For{$k = n/2 - 1$ \textbf{down to} $1$}
+    \For{$j = 1, \ldots, d - 1$}
+        \State $b(X) \mathrel{-}= \mathbf{D}_{+}[k][j](X) \cdot \mathsf{K}_{+}^{(b)}[k\!-\!1][j](X)$
+    \EndFor
+\EndFor
+\Statex
+\State \Comment{\textbf{CollapseHalf} ($-$ direction) --- sequential: uses updated $b$}
+\For{$k = n/2 - 1$ \textbf{down to} $1$}
+    \For{$j = 1, \ldots, d - 1$}
+        \State $b(X) \mathrel{-}= \mathbf{D}_{-}[k][j](X) \cdot \mathsf{K}_{-}^{(b)}[k\!-\!1][j](X)$
+    \EndFor
+\EndFor
+\Statex
+\State \Comment{\textbf{Final CollapseOne}}
+\For{$j = 1, \ldots, d - 1$}
+    \State $b(X) \mathrel{-}= \mathbf{D}_{\mathrm{final}}[j](X) \cdot \mathsf{ksk}_{-1}^{(b)}[j](X)$
+\EndFor
+\State \Return $\bigl(a(X),\; b(X)\bigr)$
+\end{algorithmic}
+\end{algorithm}
+
+\textbf{Online cost per group:} $2(n/2 - 1)(d\!-\!1) + (d\!-\!1)$ NTT-domain polynomial multiply-accumulates.
+\textbf{Key expansion:} $2(n/2 - 1)(d\!-\!1)$ automorphisms, computed once and reused across all groups.
+
+%=============================================================================
+\section{Protocol}\label{sec:protocol}
+%=============================================================================
+
+The protocol has three phases: \textbf{Setup}, \textbf{Preprocess} (server, offline), and \textbf{Online} (client + server).
+
+%-----------------------------------------------------------------------------
+\subsection{Setup}\label{sec:setup}
+%-----------------------------------------------------------------------------
+
+\begin{algorithm}[H]
+\caption{$\textsc{Setup}(N, w)$}
+\label{alg:setup}
+\begin{algorithmic}[1]
+\State \textbf{Input:} Number of database entries $N$; entry size $w$ bytes
+\State \textbf{Output:} Public parameters $\mathsf{pp}$
+\Statex
+\State $\texttt{coeffs\_per\_entry} \gets$ coefficients used to encode one entry (encoding choice; see \Cref{sec:param-select})
+\State $\texttt{db\_rows} \gets \texttt{DEFAULT\_DB\_ROWS}$ \Comment{fixed default $2^{15}$; overridable per deployment (see \Cref{sec:param-select})}
+\State $\texttt{db\_cols} \gets N \cdot \texttt{coeffs\_per\_entry} \,/\, \texttt{db\_rows}$
+\State $D \gets D_{\max}$ \Comment{interpolation degree from noise budget (\Cref{sec:dmax})}
+\State $\texttt{seed} \gets$ sample public CRS seed
+\State \Return $\mathsf{pp} = (N, w, n, p, q, d, D, \texttt{coeffs\_per\_entry}, \texttt{db\_rows}, \texttt{db\_cols}, \texttt{seed})$
+\end{algorithmic}
+\end{algorithm}
+
+The public parameters $\mathsf{pp}$ are shared between client and server. All subsequent algorithms receive $\mathsf{pp}$ implicitly.
+
+%-----------------------------------------------------------------------------
+\subsection{Preprocess}\label{sec:preprocess}
+%-----------------------------------------------------------------------------
+
+\begin{algorithm}[H]
+\caption{$\textsc{Preprocess}(\mathsf{pp},\; \texttt{db}_{\mathrm{raw}})$}
+\label{alg:preprocess}
+\begin{algorithmic}[1]
+\State \textbf{Input:} Public parameters $\mathsf{pp}$; raw database $\texttt{db}_{\mathrm{raw}}$ ($N$ records of $w$ bytes)
+\State \textbf{Output:} Encoded database $\texttt{db} \in \Z_p^{\texttt{db\_rows} \times \texttt{db\_cols}}$; InspiRING precomputation $\{\mathsf{precomp}_g\}_{g = 0}^{n_p - 1}$
+\Statex
+\State \Comment{\textbf{Step 1: Encode the database}}
+\State $\texttt{db} \gets \textsc{EncodeDatabase}(\texttt{db}_{\mathrm{raw}})$ \Comment{\Cref{alg:encode-db}}
+\Statex
+\State \Comment{\textbf{Step 2: Derive CRS polynomials for the $a$-side mat-vec}}
+\State $n_r \gets \texttt{db\_rows} / n$
+\For{$r = 0, \ldots, n_r - 1$}
+    \State $a_r(X) \gets \mathsf{H}(\texttt{seed} \,\|\, \texttt{"rlwe"} \,\|\, r)$ \Comment{same CRS as $\textsc{LWE.Enc}_b$, \Cref{alg:lwe-enc-b}}
+    \State $\tilde{a}_r(X) \gets \tau_{2n-1}\bigl(a_r(X)\bigr)$ \Comment{conjugation: $\tilde{a}_r[0]=a_r[0]$, $\tilde{a}_r[i]=-a_r[n{-}i]$ for $i \ge 1$}
+    \State Convert $\tilde{a}_r(X)$ to NTT form
+\EndFor
+\Statex
+\State \Comment{\textbf{Step 3: $a$-side mat-vec} --- produces $n$ LWE $a$-vectors per group}
+\For{$g = 0, \ldots, n_p - 1$}
+    \For{$j = 0, \ldots, n - 1$} \Comment{$n$ columns within group $g$}
+        \State $\mathsf{acc}(X) \gets 0$ in NTT form
+        \For{$r = 0, \ldots, n_r - 1$}
+            \State $f_{r,j}(X) \gets \sum_{i=0}^{n-1} \texttt{db}[r n + i][g n + j] \cdot X^i$ \Comment{column $g n + j$, row block $r$}
+            \State Convert $f_{r,j}(X)$ to NTT form
+            \State $\mathsf{acc} \mathrel{+}= f_{r,j} \circ \tilde{a}_r$ \Comment{pointwise multiply in NTT, accumulate}
+        \EndFor
+        \State Convert $\mathsf{acc}(X)$ to coefficient form
+        \State $\mathbf{a}_{g,j} \gets \bigl(\mathsf{acc}[0],\,\ldots,\,\mathsf{acc}[n-1]\bigr) \in \Z_q^n$ \Comment{LWE $a$-vector for column $g n + j$}
+    \EndFor
+\EndFor
+\Statex
+\State \Comment{\textbf{Step 4: Packing offline} --- one $\textsc{InspiRINGOffline}$ call per group}
+\For{$g = 0, \ldots, n_p - 1$}
+    \State $\mathsf{precomp}_g \gets \textsc{InspiRINGOffline}\bigl(\mathbf{a}_{g,0}, \ldots, \mathbf{a}_{g,n-1},\; \texttt{seed}\bigr)$ \Comment{\Cref{alg:pack-offline}}
+\EndFor
+\State \Return $\bigl(\texttt{db},\; \{\mathsf{precomp}_g\}_{g=0}^{n_p - 1}\bigr)$
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Why the $a$-side reduces to a polynomial product.}
+The naive $a$-side mat-vec would compute, for each output column $j$, an $n$-dimensional vector $\mathbf{a}_j[k] = \sum_i \texttt{db}[i][j] \cdot \mathbf{a}_{\mathrm{lwe}}[i][k]$, where $\mathbf{a}_{\mathrm{lwe}}[i]$ is the implicit LWE $a$-vector at row $i$.
+Splitting $i = rn + i'$, the row block $r$ uses the negacyclic matrix of $a_r(X)$ (\Cref{rem:ring-struct}): $\mathbf{a}_{\mathrm{lwe}}[rn{+}i'][k] = a_r[i'{-}k]$ for $k \le i'$ and $-a_r[n{+}i'{-}k]$ for $k > i'$.
+A direct calculation shows that the $k$-th coefficient of the ring product $f_{r,j}(X) \cdot \tilde{a}_r(X)$ in $\Rq$ equals $\sum_{i'} f_{r,j}[i'] \cdot \mathbf{a}_{\mathrm{lwe}}[rn{+}i'][k]$, so accumulating $\sum_r f_{r,j} \cdot \tilde{a}_r$ and reading off the $n$ coefficients yields exactly $\mathbf{a}_{g,j}$.
+This replaces an $n_r \cdot n^2$ scalar mat-vec per output column with a single length-$n$ NTT product per $(r,j)$.
+
+This precomputation depends on the database and the CRS seed (not on the client's query).
+The key-dependent Collapse ($\textsc{InspiRINGOnline}$, \Cref{alg:pack-online}) runs once the client sends $\mathsf{ksk}^{(b)}$ at query time.
+
+\begin{algorithm}[H]
+\caption{$\textsc{EncodeDatabase}(\texttt{db}_{\mathrm{raw}})$: Pack raw bytes and apply polynomial interpolation encoding.}
+\label{alg:encode-db}
+\begin{algorithmic}[1]
+\State \textbf{Input:} Raw database $\texttt{db}_{\mathrm{raw}}$ ($N$ records of $w$ bytes); parameters $\texttt{db\_rows},\, \texttt{db\_cols},\, D$ from $\mathsf{pp}$
+\State \textbf{Output:} Encoded matrix $\texttt{db} \in \Z_p^{\texttt{db\_rows} \times \texttt{db\_cols}}$
+\Statex
+\State \Comment{\textbf{Encode each entry as $\texttt{coeffs\_per\_entry}$ coefficients in $[0, p)$}}
+\State $\texttt{db} \gets \mathbf{0}$
+\For{$e = 0, \ldots, N - 1$}
+    \State $\texttt{row} \gets e \bmod \texttt{db\_rows}$
+    \State $\texttt{col\_start} \gets \floor{e / \texttt{db\_rows}} \cdot \texttt{coeffs\_per\_entry}$
+    \State $(c_0,\, c_1,\, \ldots,\, c_{\texttt{coeffs\_per\_entry}-1}) \gets \textsc{Encode}_p\bigl(\texttt{db}_{\mathrm{raw}}[e]\bigr)$ \Comment{encoding scheme fixed by $\mathsf{pp}$; see \Cref{sec:param-select}}
+    \For{$j = 0, \ldots, \texttt{coeffs\_per\_entry} - 1$}
+        \State $\texttt{db}[\texttt{row}][\texttt{col\_start} + j] \gets c_j$
+    \EndFor
+\EndFor
+\Statex
+\State \Comment{\textbf{Per-row inverse DFT across packing groups}}
+\State $n_p \gets \texttt{db\_cols} / n$
+\State $D_{\mathrm{act}} \gets \min(D,\; n_p)$ \Comment{small-DB fallback: when $n_p < D$, encode at the smaller degree}
+\If{$D_{\mathrm{act}} \le 1$} \State \Return $\texttt{db}$ \Comment{no interpolation needed} \EndIf
+\State $\texttt{num\_cts} \gets n_p / D_{\mathrm{act}}$
+\State $D_{\mathrm{inv}} \gets D_{\mathrm{act}}^{-1} \bmod p$
+\For{$\texttt{row} = 0, \ldots, \texttt{db\_rows} - 1$}
+    \For{$\texttt{ct} = 0, \ldots, \texttt{num\_cts} - 1$}
+        \State \Comment{Gather $D_{\mathrm{act}}$ ring elements: one length-$n$ polynomial per packing group}
+        \For{$d = 0, \ldots, D_{\mathrm{act}} - 1$}
+            \For{$k = 0, \ldots, n - 1$}
+                \State $\texttt{pts}[d][k] \gets \texttt{db}[\texttt{row}][\texttt{ct} \cdot D_{\mathrm{act}} \cdot n + d \cdot n + k]$
+            \EndFor
+        \EndFor
+        \State $\texttt{coeffs} \gets \textsc{InverseDFT}(\texttt{pts},\; p)$ \Comment{\Cref{alg:inversedft}; length-$D_{\mathrm{act}}$ DFT over $\Rp$}
+        \For{$d = 0, \ldots, D_{\mathrm{act}} - 1$}
+            \For{$k = 0, \ldots, n - 1$}
+                \State $\texttt{db}[\texttt{row}][\texttt{ct} \cdot D_{\mathrm{act}} \cdot n + d \cdot n + k] \gets D_{\mathrm{inv}} \cdot \texttt{coeffs}[d][k] \bmod p$
+            \EndFor
+        \EndFor
+    \EndFor
+\EndFor
+\State \Return $\texttt{db}$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{remark}[Choice of $\textsc{Encode}_p$]
+Two natural realizations of $\textsc{Encode}_p$:
+\begin{itemize}[nosep]
+    \item \emph{Bit-packing.} Split the $8w$-bit input into chunks of $\floor{\log_2 p}$ bits, each interpreted as a coefficient in $[0, 2^{\floor{\log_2 p}}) \subseteq [0, p)$. Simple and efficient; uses $\texttt{coeffs\_per\_entry} = \ceil{8w / \floor{\log_2 p}}$ coefficients per entry. Wastes $\log_2 p - \floor{\log_2 p}$ bits per coefficient.
+    \item \emph{Base-$p$ digits.} Interpret the $8w$-bit input as an integer and write it in base $p$. Uses $\texttt{coeffs\_per\_entry} = \ceil{8w / \log_2 p}$ coefficients per entry, recovering nearly all of $\log_2 p$ bits per coefficient. Requires big-integer arithmetic during encode/decode.
+\end{itemize}
+The default (Section~\ref{sec:param-select}) is bit-packing; switch to base-$p$ when the residual $\log_2 p - \floor{\log_2 p}$ bits matter.
+$\textsc{Decode}_p$ (the inverse map) is applied during $\textsc{Extract}$ (\Cref{alg:extract}).
+\end{remark}
+
+\paragraph{InverseDFT over $\Rp$.}\label{par:inversedft}
+The polynomial interpolation encoding uses a Cooley--Tukey inverse DFT over $\Rp = \Z_p[X]/(X^n+1)$.
+The ``evaluation points'' are powers of a primitive element $\omega(X) \in \Rp$ with $\omega^D = 1$ (i.e., $\omega$ is a $D$-th root of unity in the ring $\Rp$).
+Since $D$ is a power of two and $D \mid n$ (both are powers of two), we can take $\omega(X) = X^{n/D}$: then $\omega^d = X^n \equiv -1 \pmod{X^n+1}$.
+For even $d$: $\omega^{D/2} = X^{n/2}$, and $\omega^d = X^n = -1$, so $\omega$ is a $2d$-th root of unity, suitable for a length-$D$ negacyclic DFT.
+
+\begin{algorithm}[H]
+\caption{$\textsc{InverseDFT}(\texttt{pts}[0\mathinner{.\,.}D\!-\!1], p)$: Cooley--Tukey inverse DFT over $\Rp$.}
+\label{alg:inversedft}
+\begin{algorithmic}[1]
+\State \textbf{Input:} $D$ ring elements $\texttt{pts}[j] \in \Rp$ (evaluation points); plaintext modulus $p$; $d$ is a power of two
+\State \textbf{Output:} $D$ ring elements $\texttt{coeffs}[j] \in \Rp$ (polynomial coefficients)
+\State $\omega(X) \gets X^{n/d} \in \Rp$ \Comment{$D$-th root of unity; $\omega^D \equiv -1$}
+\State $\texttt{buf}[j] \gets \texttt{pts}[j]$ for $j = 0, \ldots, d-1$ \Comment{bit-reverse permutation of indices}
+\Statex
+\State \Comment{Cooley--Tukey butterfly (in-place, inverse direction)}
+\State $m \gets 1$ \Comment{half-group size}
+\While{$m < D$}
+    \State $w \gets \omega^{-d/(2m)} \pmod{p}$ \Comment{twiddle factor: inverse root of unity}
+    \State $w_j \gets 1$
+    \For{$j = 0, \ldots, m - 1$}
+        \For{$k = j, j + 2m, j + 4m, \ldots$} \Comment{stride $2m$}
+            \State $u \gets \texttt{buf}[k]$; \quad $v \gets \texttt{buf}[k + m] \cdot w_j \pmod{p}$ \Comment{ring multiply in $\Rp$}
+            \State $\texttt{buf}[k] \gets u + v \pmod{p}$
+            \State $\texttt{buf}[k + m] \gets u - v \pmod{p}$
+        \EndFor
+        \State $w_j \gets w_j \cdot w \pmod{p}$ \Comment{ring multiply by twiddle}
+    \EndFor
+    \State $m \gets 2m$
+\EndWhile
+\State \Return $\texttt{buf}$ \Comment{the normalization by $D^{-1}$ is applied by the caller}
+\end{algorithmic}
+\end{algorithm}
+
+\begin{remark}
+The ``multiply by twiddle'' steps are ring multiplications in $\Rp$: multiplying a polynomial by $\omega^k(X) = X^{kn/d}$ is a negacyclic shift (rotate coefficients with sign flips), not a scalar multiply.
+For $D \le 256$ and $n = 2048$, each twiddle is a monomial $X^{kn/D}$ with $n/D \ge 8$, so the shift is coarse-grained and efficient.
+\end{remark}
+
+%-----------------------------------------------------------------------------
+\subsection{Query}\label{sec:query}
+%-----------------------------------------------------------------------------
+
+\begin{algorithm}[H]
+\caption{$\textsc{Query}(\mathsf{pp},\; \mathsf{idx})$}
+\label{alg:query}
+\begin{algorithmic}[1]
+\State \textbf{Input:} Public parameters $\mathsf{pp}$; target index $\mathsf{idx} \in \{0, \ldots, N-1\}$
+\State \textbf{Output:} Query state $\mathsf{qst}$ (kept by client for \Cref{alg:extract}); query $\mathsf{qry}$ (sent to server)
+\Statex
+\State \Comment{\textbf{Index decomposition}}
+\State $i^* \gets \mathsf{idx} \bmod \texttt{db\_rows}$ \Comment{target row (first dimension)}
+\State $\mathsf{col} \gets \floor{\mathsf{idx} / \texttt{db\_rows}} \cdot \texttt{coeffs\_per\_entry}$ \Comment{starting column of target entry}
+\State $j^* \gets \floor{\mathsf{col} / n} \bmod D$ \Comment{evaluation point (Horner)}
+\State $k^* \gets \floor{\mathsf{col} / (n \cdot D)}$ \Comment{response ciphertext index}
+\State $\ell^* \gets \mathsf{col} \bmod n$ \Comment{coefficient offset within ciphertext}
+\Statex
+\State \Comment{\textbf{KeyGen}}
+\State $s(X) \gets \textsc{SKGen}()$ \Comment{\Cref{alg:skgen}}
+\State $\mathsf{ksk}_5^{(b)} \gets \textsc{KskGen}_b(s(X), 5, \mathsf{pp}.\texttt{seed})$ \Comment{\Cref{alg:ksk-gen}}
+\State $\mathsf{ksk}_{-1}^{(b)} \gets \textsc{KskGen}_b(s(X), 2n\!-\!1, \mathsf{pp}.\texttt{seed})$ \Comment{\Cref{alg:ksk-gen}}
+\Statex
+\State \Comment{\textbf{Encrypt}}
+\State $\mathsf{ct}_{\mathrm{lwe}}^{(b)} \gets \textsc{LWE.Enc}_b(s(X), i^*, \mathsf{pp}.\texttt{db\_rows}, \mathsf{pp}.\texttt{seed})$ \Comment{\Cref{alg:lwe-enc-b}}
+\State $\mathsf{ct}_{\mathrm{rgsw}}^{(b)} \gets \textsc{RGSW.Enc}_b(s(X),\; X^{j^* \cdot n/D},\; \mathsf{pp}.\texttt{seed})$ \Comment{\Cref{alg:rgsw-enc}; evaluation point $\omega^{j^*}$}
+\Statex
+\State $\mathsf{qst} \gets (s(X),\; k^*,\; \ell^*)$
+\State $\mathsf{qry} \gets (\mathsf{ksk}_5^{(b)},\; \mathsf{ksk}_{-1}^{(b)},\; \mathsf{ct}_{\mathrm{lwe}}^{(b)},\; \mathsf{ct}_{\mathrm{rgsw}}^{(b)})$
+\State \Return $(\mathsf{qst},\; \mathsf{qry})$
+\end{algorithmic}
+\end{algorithm}
+
+%-----------------------------------------------------------------------------
+\subsection{Answer}\label{sec:answer}
+%-----------------------------------------------------------------------------
+
+\begin{algorithm}[H]
+\caption{$\textsc{Answer}(\mathsf{pp},\; \mathsf{qry},\; \mathsf{precomp})$}
+\label{alg:answer}
+\begin{algorithmic}[1]
+\State \textbf{Input:} Public parameters $\mathsf{pp}$; query $\mathsf{qry}$; $\mathsf{precomp}$ from \Cref{alg:preprocess}
+\State \textbf{Output:} Response $\mathsf{resp}$: $c$ RLWE ciphertexts in $\Rq$
+\State Unpack $\mathsf{qry} = (\mathsf{ksk}_5,\; \mathsf{ksk}_{-1},\; \mathsf{ct}_{\mathrm{lwe}}^{(b)},\; \mathsf{ct}_{\mathrm{rgsw}})$
+\Statex \Comment{\textbf{Step 1: Matrix--vector product ($b$-side only; $a$-side was precomputed in $\textsc{Preprocess}$)}}
+\For{$j = 0, \ldots, \texttt{db\_cols} - 1$} \Comment{parallel over $j$}
+    \State $\tilde{\mathsf{ct}}_{\mathrm{lwe}}^{(b)}[j] \gets \sum_{i} \texttt{db}[i][j] \cdot \mathsf{ct}_{\mathrm{lwe}}^{(b)}[i] \pmod{q}$ \Comment{\texttt{u16} $\times$ \texttt{u64}, per RNS limb}
+\EndFor
+\Statex \Comment{\textbf{Step 2: InspiRING packing} (combines precomputed $a$-path with online $b$-values)}
+\State $\bigl(\mathsf{K}_{+}^{(b)},\; \mathsf{K}_{-}^{(b)}\bigr) \gets \textsc{ExpandKSK}_b(\mathsf{ksk}_5^{(b)})$ \Comment{\Cref{alg:expand-ksk}}
+\State $n_p \gets \texttt{db\_cols} / n$
+\For{$g = 0, \ldots, n_p - 1$}
+    \State $\mathsf{ct}_{\mathrm{rlwe}}[g] \gets \textsc{InspiRINGOnline}\bigl(\mathsf{precomp}_g,\; \mathsf{K}_{+}^{(b)},\; \mathsf{K}_{-}^{(b)},\; \mathsf{ksk}_{-1}^{(b)},\; \tilde{\mathsf{ct}}_{\mathrm{lwe}}^{(b)}[gn \mathinner{.\,.} (g\!+\!1)n\!-\!1]\bigr)$ \Comment{\Cref{alg:pack-online}}
+\EndFor
+\Statex \Comment{\textbf{Step 3: Horner evaluation} (\Cref{alg:horner})}
+\State $c \gets n_p / D$
+\For{$g = 0, \ldots, c - 1$} \Comment{parallel over $g$}
+    \State $\mathsf{resp}[g] \gets \textsc{HornerEval}\bigl(\mathsf{ct}_{\mathrm{rlwe}}[g \cdot D \mathinner{.\,.} (g\!+\!1)D\!-\!1],\; \mathsf{ct}_{\mathrm{rgsw}}\bigr)$
+\EndFor
+\State \Return $\mathsf{resp}[0 \mathinner{.\,.} c\!-\!1]$
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{$\textsc{HornerEval}(\mathsf{ct}_{\mathrm{rlwe}}[0 \mathinner{.\,.} D\!-\!1],\; \mathsf{ct}_{\mathrm{rgsw}})$: Evaluate one interpolation polynomial via Horner's method.}
+\label{alg:horner}
+\begin{algorithmic}[1]
+\State \textbf{Input:} $D$ packed RLWE ciphertexts $\mathsf{ct}_{\mathrm{rlwe}}[0 \mathinner{.\,.} D\!-\!1]$; RGSW ciphertext $\mathsf{ct}_{\mathrm{rgsw}}$
+\State \textbf{Output:} Single RLWE ciphertext
+\Statex
+\State $\mathsf{acc} \gets \mathsf{ct}_{\mathrm{rlwe}}[D - 1]$ \Comment{initialize with last ciphertext}
+\For{$i = D - 2$ \textbf{down to} $0$}
+    \State $\mathsf{acc} \gets \ExternalProd(\mathsf{ct}_{\mathrm{rgsw}},\; \mathsf{acc})$ \Comment{\Cref{alg:extprod}}
+    \State $\mathsf{acc} \gets \mathsf{acc} + \mathsf{ct}_{\mathrm{rlwe}}[i] \pmod{q}$
+\EndFor
+\State \Return $\mathsf{acc}$
+\end{algorithmic}
+\end{algorithm}
+
+%-----------------------------------------------------------------------------
+\subsection{Extract}\label{sec:extract}
+%-----------------------------------------------------------------------------
+
+\begin{algorithm}[H]
+\caption{$\textsc{Extract}(\mathsf{pp},\; \mathsf{qst},\; \mathsf{resp})$}
+\label{alg:extract}
+\begin{algorithmic}[1]
+\State \textbf{Input:} Public parameters $\mathsf{pp}$; query state $\mathsf{qst} = (s(X), k^*, \ell^*)$; $c$ RLWE ciphertexts
+\State \textbf{Output:} Retrieved entry ($w$ bytes)
+\Statex
+\State $m(X) \gets \textsc{RLWE.Dec}(s(X),\; \mathsf{resp}[k^*])$ \Comment{\Cref{alg:dec}; $k^*$ selects the polynomial group}
+\State $(c_0, \ldots, c_{\texttt{coeffs\_per\_entry}-1}) \gets \bigl(m[\ell^*], \ldots, m[\ell^* + \texttt{coeffs\_per\_entry} - 1]\bigr) \in \Z_p^{\texttt{coeffs\_per\_entry}}$ \Comment{$\ell^*$ is the coefficient offset}
+\State \Return $\textsc{Decode}_p(c_0, \ldots, c_{\texttt{coeffs\_per\_entry}-1})$ \Comment{inverse of $\textsc{Encode}_p$ from \Cref{alg:encode-db}; recovers $w$ bytes}
+\end{algorithmic}
+\end{algorithm}
+
+
+%=============================================================================
+\section{Serialization and Communication Cost}\label{sec:serialization}
+%=============================================================================
+
+The protocol transmits a query (client $\to$ server) and a response (server $\to$ client).
+All values are bit-packed at the exact bit width (no byte-alignment padding).
+RLWE ciphertexts in the query use a \emph{common reference string} (CRS/seed) for their $a(X)$ polynomials; only the $b(X)$ part is transmitted.
+
+%-----------------------------------------------------------------------------
+\subsection{Query Serialization}\label{sec:serialize-query}
+%-----------------------------------------------------------------------------
+
+\begin{algorithm}[H]
+\caption{$\textsc{SerializeQuery}(\mathsf{qry})$}
+\label{alg:serialize-query}
+\begin{algorithmic}[1]
+\State \textbf{Input:} $\mathsf{qry} = (\mathsf{ksk}_5^{(b)}, \mathsf{ksk}_{-1}^{(b)}, \mathsf{ct}_{\mathrm{lwe}}^{(b)}, \mathsf{ct}_{\mathrm{rgsw}}^{(b)})$
+\State \textbf{Output:} Bit-packed byte stream
+\State \Comment{\textbf{Key-switching key $b$-parts}: $2(d\!-\!1)$ polynomials in NTT form}
+\State Bit-pack $\mathsf{ksk}_5^{(b)}$ and $\mathsf{ksk}_{-1}^{(b)}$: $2(d\!-\!1)$ polynomials, each $n \cdot \beta$ bits
+\Statex
+\State \Comment{\textbf{LWE $b$-values}}
+\State Bit-pack $\mathsf{ct}_{\mathrm{lwe}}^{(b)}$: $\texttt{db\_rows}$ scalars, each $\beta = 54$ bits
+\Statex
+\State \Comment{\textbf{RGSW query $b$-parts}: $4(d\!-\!1)$ polynomials in NTT form}
+\State Bit-pack $\mathsf{ct}_{\mathrm{rgsw}}^{(b)}$: $4(d\!-\!1)$ polynomials, each $n \cdot \beta$ bits
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{$\textsc{DeserializeQuery}(\mathsf{pp}, \texttt{bytes})$: Server-side.}
+\label{alg:deserialize-query}
+\begin{algorithmic}[1]
+\State Parse $\mathsf{qry}$ components from bit stream: $\mathsf{ksk}_5^{(b)}$, $\mathsf{ksk}_{-1}^{(b)}$, $\mathsf{ct}_{\mathrm{lwe}}^{(b)}$, $\mathsf{ct}_{\mathrm{rgsw}}^{(b)}$
+\State Reconstruct $a$-parts from CRS via~\eqref{eq:ksk-a}
+\State Assemble full keys: $\mathsf{ksk}_k = (\mathsf{ksk}_k^{(a)},\; \mathsf{ksk}_k^{(b)})$; full RGSW similarly
+\State \Return deserialized $\mathsf{qry}$ with full $(a,b)$-parts
+\end{algorithmic}
+\end{algorithm}
+
+%-----------------------------------------------------------------------------
+\subsection{Response Serialization (Modulus Switching)}\label{sec:serialize-response}
+%-----------------------------------------------------------------------------
+
+Modulus switching compresses the response by reducing the ciphertext modulus.
+This is purely a serialization optimization: it trades noise budget for smaller wire size.
+
+\begin{algorithm}[H]
+\caption{$\textsc{SerializeResponse}(\mathsf{resp})$: Server-side, applied after $\textsc{Answer}$.}
+\label{alg:serialize-response}
+\begin{algorithmic}[1]
+\State \textbf{Input:} $c$ RLWE ciphertexts in $\Rq$
+\For{$g = 0, \ldots, c - 1$}
+    \State $(a(X), b(X)) \gets \mathsf{resp}[g]$
+    \State $b'[j] \gets \round{b[j] \cdot q'_0 / q}$ for $j = 0, \ldots, n-1$ \Comment{20-bit coefficients}
+    \State $a'[j] \gets \round{a[j] \cdot q'_1 / q}$ for $j = 0, \ldots, n-1$ \Comment{28-bit coefficients}
+    \State Serialize $(a', b')$
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+\begin{algorithm}[H]
+\caption{$\textsc{DeserializeResponse}(\texttt{bytes})$: Client-side, applied before $\textsc{Extract}$.}
+\label{alg:deserialize-response}
+\begin{algorithmic}[1]
+\For{$g = 0, \ldots, c - 1$}
+    \State Parse $(a', b')$ from byte stream
+    \State $b(X) \gets \round{b'[j] \cdot q / q'_0}$ for each $j$ \Comment{rescale back to $\Z_q$}
+    \State $a(X) \gets \round{a'[j] \cdot q / q'_1}$ for each $j$
+    \State $\mathsf{resp}[g] \gets (a(X), b(X))$
+\EndFor
+\State \Return $\mathsf{resp}[0 \mathinner{.\,.} c\!-\!1]$
+\end{algorithmic}
+\end{algorithm}
+
+%-----------------------------------------------------------------------------
+\subsection{Communication Cost Formulas}\label{sec:comm-cost}
+%-----------------------------------------------------------------------------
+
+Let $\beta = \ceil{\log_2 q}$ and $(d-1)$ (approximate gadget digits).
+Let $\beta'_0 = \log_2 q'_0$ and $\beta'_1 = \log_2 q'_1$ (response coefficient widths).
+
+\paragraph{Query cost.}
+\begin{equation}
+    |\mathsf{query}| = \underbrace{\texttt{db\_rows} \cdot \beta}_{\text{$b$-values}} + \underbrace{6(d\!-\!1) \cdot n \cdot \beta}_{\text{$\mathsf{ct}_{\mathrm{rgsw}}^{(b)}$ ($4(d\!-\!1)$) + $\mathsf{ksk}^{(b)}$ ($2(d\!-\!1)$)}} \quad \text{bits}
+    \label{eq:query-cost}
+\end{equation}
+
+The second term is a fixed overhead independent of the database; only the $b$-values scale with the database.
+
+\paragraph{Response cost.}
+\begin{equation}
+    |\mathsf{response}| = c \cdot n \cdot (\beta'_0 + \beta'_1) \quad \text{bits}
+    \label{eq:response-cost}
+\end{equation}
+where $c = \texttt{db\_cols} / (n \cdot D)$ is the number of output ciphertexts.
+
+\paragraph{Total.}
+\begin{equation}
+    |\mathsf{total}| = \texttt{db\_rows} \cdot \beta + 6(d\!-\!1) \cdot n \cdot \beta + \frac{\texttt{db\_cols}}{n \cdot D} \cdot n \cdot (\beta'_0 + \beta'_1)
+    \label{eq:total-cost}
+\end{equation}
+
+Since $\texttt{db\_rows} \cdot \texttt{db\_cols} = N \cdot \texttt{coeffs\_per\_entry}$ (total coefficients in the encoded database), the first and third terms have an inverse relationship: increasing $\texttt{db\_rows}$ decreases $\texttt{db\_cols}$ (and thus $c$), and vice versa.
+The optimal $\texttt{db\_rows}$ (power of two) minimizes~\eqref{eq:total-cost}.
+
+%=============================================================================
+\section{Error Analysis}\label{sec:noise}
+%=============================================================================
+
+%-----------------------------------------------------------------------------
+\subsection{Noise Sources}
+%-----------------------------------------------------------------------------
+
+We track the noise $v(X) = b(X) - a(X) \cdot s(X) - \Delta \cdot m(X)$ throughout the protocol.
+Decryption succeeds when $\norm{v(X)} < \Delta/2$.
+
+\paragraph{Subgaussian convention.}
+A zero-mean random variable $Z$ is $\sigma$-subgaussian if $\mathbb{E}[\exp(tZ)] \le \exp(\sigma^2 t^2/2)$ for all $t$.
+Tail bound: $\Pr[|Z| \ge u] \le 2\exp(-u^2/(2\sigma^2))$.
+Key property (ring product): for fixed $c(X) \in \Rq$ and $e(X)$ with independent $\sigma$-subgaussian coefficients, each coefficient of $c(X) \cdot e(X)$ has subgaussian parameter $\le \|c(X)\|_2 \cdot \sigma \le \sqrt{n}\, \|c(X)\|_\infty \cdot \sigma$.
+
+\begin{remark}[Independence heuristic]\label{rem:independence}
+The noise analysis assumes that noise contributions from different steps (encryption errors, key-switch errors, external-product errors) are \emph{independent}.
+In practice, these terms share the same secret key $s$ and may exhibit correlations through the ring structure.
+We follow the standard approach in the HE literature~\cite{bfv,seal}: treat the noise terms as independent subgaussians and sum their variances.
+This heuristic is well-validated empirically and is used by all major HE libraries for parameter selection.
+\end{remark}
+
+\begin{enumerate}[nosep]
+    \item \textbf{Fresh encryption noise.} Each coefficient of $e(X)$ is $\sigma$-subgaussian ($\sigma = 3.2$).
+
+    \item \textbf{First-dimension accumulation.}
+    For column $j$: $\mathsf{noise}_j = \sum_{i=0}^{\texttt{db\_rows}-1} \texttt{db}[i][j] \cdot e_i$.
+    Each $e_i$ is $\sigma$-subgaussian (independent); each $|\texttt{db}[i][j]| \le p$.
+    By the subgaussian product rule, each term $\texttt{db}[i][j] \cdot e_i$ is $(p \cdot \sigma)$-subgaussian.
+    Summing $\texttt{db\_rows}$ independent terms:
+    \begin{equation}
+        \sigma_{\mathrm{first}}^2 = \texttt{db\_rows} \cdot p^2 \cdot \sigma^2 = d_0 \cdot n \cdot p^2 \cdot \sigma^2
+        \label{eq:noise-first}
+    \end{equation}
+    where $d_0 = \texttt{db\_rows}/n$.
+    \emph{Note:} the reference formula uses $d_0 \cdot p^2 \cdot \sigma^2$ (without the factor $n$) because the InspiRING packing distributes the accumulated noise across $n$ coefficient slots.
+    After packing, the per-coefficient variance is $d_0 \cdot p^2 \cdot \sigma^2$.
+
+    \item \textbf{Key switching (InspiRING Collapse).}
+
+    \emph{Derivation.}
+    Each Collapse step performs $(d\!-\!1)$ polynomial multiplications of a gadget digit $\mathbf{T}[k][j]$ (coefficients bounded by $B/2$) with a $\mathsf{ksk}$ component (whose noise has $\sigma$-subgaussian coefficients).
+
+    For the product $\mathbf{T}[k][j](X) \cdot e_j(X)$ in $\Rq$: the ring product property gives per-coefficient subgaussian parameter $\|\mathbf{T}[k][j](X)\|_2 \cdot \sigma$.
+    For centered digits uniform on $[-B/2, B/2)$: $\|\mathbf{T}[k][j](X)\|_2^2 \le n B^2/12$.
+    Per-coefficient variance: $n B^2 \sigma^2 / 12$ per digit.
+
+    Over $(d\!-\!1)$ digits per step: $(d\!-\!1) \cdot n B^2 \sigma^2 / 12$.
+    Over $n/2$ steps:
+    \begin{equation}
+        \sigma_{\mathrm{ks}}^2 = \frac{(d\!-\!1) \cdot n^2 \cdot B^2 \cdot \sigma^2}{24}
+        \label{eq:noise-ks}
+    \end{equation}
+
+    The forward and conjugate passes each contribute~\eqref{eq:noise-ks}, but act on complementary halves of the coefficient space, so the per-coefficient variance is~\eqref{eq:noise-ks} (not doubled).
+
+    \item \textbf{RGSW external product (per Horner step).}
+
+    \emph{Derivation.}
+    One external product decomposes both components $a(X)$ and $b(X)$ of the RLWE ciphertext into $(d\!-\!1)$ digits each ($2(d\!-\!1)$ total), multiplied by $2(d\!-\!1)$ RGSW rows.
+    The per-external-product variance is:
+    \begin{equation}
+        \sigma_{\mathrm{rgsw}}^2 = \frac{(d\!-\!1) \cdot n \cdot B^2 \cdot \sigma^2}{6}
+        \label{eq:noise-rgsw}
+    \end{equation}
+
+    (The $B^2/6$ factor is $2 \times nB^2/12$ summed over both ciphertext components, divided by $n$.)
+
+    In practice, $\sigma_{\mathrm{rgsw}} \ll \sigma_{\mathrm{ks}}$ (key switching dominates).
+
+    \item \textbf{Modulus switching rounding} (\Cref{sec:serialize-response}).
+    The round-trip $q \to q' \to q$ introduces rounding noise per coefficient:
+    \begin{itemize}[nosep]
+        \item Body ($b$): $\le q/(2\,q'_0) \approx 2^{33}$.
+        \item Mask ($a$): $\le q/(2\,q'_1) \approx 2^{25}$ per coefficient, amplified by $s(X)$ in decryption: total $\le n \cdot q/(2\,q'_1) \approx 2^{36}$.
+    \end{itemize}
+    Combined: $\le 2^{33} + 2^{36} \approx 2^{36.2}$, consuming ${\approx}\,56\%$ of $\Delta/2 \approx 2^{37}$.
+    This is a \emph{deterministic} (worst-case) bound, not subgaussian; it must be subtracted from the noise budget before allocating the remaining budget to the subgaussian computation noise.
+\end{enumerate}
+
+%-----------------------------------------------------------------------------
+\subsection{Combined Noise Before Horner Evaluation}\label{sec:noise-combined}
+%-----------------------------------------------------------------------------
+
+\begin{theorem}[Pre-Horner noise variance]\label{thm:noise}
+The noise variance per coefficient after the first dimension + InspiRING packing is the sum of~\eqref{eq:noise-first},~\eqref{eq:noise-ks}, and~\eqref{eq:noise-rgsw}:
+\begin{equation}
+    \boxed{\hat{\sigma}_{\mathrm{before}}^2
+    = \underbrace{d_0 \cdot p^2 \cdot \sigma^2}_{\text{first dim~\eqref{eq:noise-first}}}
+    + \underbrace{\frac{(d\!-\!1) \cdot n^2 \cdot B^2 \cdot \sigma^2}{24}}_{\text{key switching~\eqref{eq:noise-ks}}}
+    + \underbrace{\frac{(d\!-\!1) \cdot n \cdot B^2 \cdot \sigma^2}{6}}_{\text{RGSW ext.\ prod.~\eqref{eq:noise-rgsw}}}}
+    \label{eq:sigma-before}
+\end{equation}
+where $d_0 = \texttt{db\_rows}/n$.
+The approximate gadget adds a bounded residual $\le B/2$ per coefficient per step, which is negligible when $B/2 \ll \Delta/2$.
+\end{theorem}
+
+\paragraph{Numerical values (concrete instantiation, \Cref{sec:concrete}).}
+\begin{align*}
+    \sigma_{\mathrm{first}}^2 &= 16 \cdot 65535^2 \cdot 3.2^2 \approx 2^{39.4} && (\log_2\text{-std} \approx 19.7; \; d_0 = 16 \text{ for } \texttt{db\_rows} = 2^{15}) \\
+    \sigma_{\mathrm{ks}}^2 &= 2 \cdot 2048^2 \cdot (2^{18})^2 \cdot 3.2^2 / 24 \approx 2^{57.9} && (\log_2\text{-std} \approx 28.9 \;\text{--- dominates}) \\
+    \sigma_{\mathrm{rgsw}}^2 &= 2 \cdot 2048 \cdot (2^{18})^2 \cdot 3.2^2 / 6 \approx 2^{48.8} && (\log_2\text{-std} \approx 24.4) \\[6pt]
+    \hat{\sigma}_{\mathrm{before}}^2 &\approx 2^{57.9} && \log_2 \hat{\sigma}_{\mathrm{before}} \approx 28.9
+\end{align*}
+
+%-----------------------------------------------------------------------------
+\subsection{Maximum Interpolation Degree}\label{sec:dmax}
+%-----------------------------------------------------------------------------
+
+The noise budget must accommodate both the \emph{deterministic} modulus-switching noise and the \emph{subgaussian} computation noise.
+The modswitch noise is $v_{\mathrm{ms}} \approx 2^{36.2}$ (\Cref{sec:serialize-response}).
+The subgaussian computation noise (failure probability $< 2^{-40}$) must satisfy $\hat{\sigma}_{\mathrm{total}} \cdot \sqrt{80 \ln 2} + v_{\mathrm{ms}} < \Delta/2$ (using the subgaussian tail bound $\Pr[|Z| \ge u] \le 2\exp(-u^2/(2\sigma^2))$, which requires $u^2/(2\sigma^2) \ge 40\ln 2$).
+
+Effective subgaussian budget after deducting modswitch noise:
+\begin{equation}
+    \hat{\sigma}_{\mathrm{ub}} = \frac{\Delta/2 - v_{\mathrm{ms}}}{\sqrt{80 \ln 2}}
+    \quad\Longrightarrow\quad
+    \log_2 \hat{\sigma}_{\mathrm{ub}} \approx 32.9
+    \label{eq:sigma-ub}
+\end{equation}
+
+Each Horner step adds noise of the same order as $\hat{\sigma}_{\mathrm{before}}$.
+After $D$ steps, the total computation noise is $\approx \hat{\sigma}_{\mathrm{before}} \cdot \sqrt{D}$.
+
+\begin{equation}
+    \boxed{D_{\max} = \floor{\left(\frac{\hat{\sigma}_{\mathrm{ub}}}{\hat{\sigma}_{\mathrm{before}}}\right)^2} = \floor{2^{2(32.9 - 28.9)}} = \floor{2^{8.0}} = 264 \quad \text{(approximate centered gadget)}}
+    \label{eq:dmax}
+\end{equation}
+
+\begin{table}[ht]\centering
+\caption{$D_{\max}$ comparison (accounting for modulus-switching noise).}
+\label{tab:dmax}
+\begin{tabular}{@{}lcccl@{}}
+\toprule
+\textbf{Strategy} & $\log_2 \hat{\sigma}_{\mathrm{before}}$ & $D_{\max}$ (pre-ms) & $D_{\max}$ (with ms) & \textbf{Notes} \\
+\midrule
+Non-centered, exact              & 30.2 & 230 &  44 & Baseline \\
+Non-centered, approx             & 29.9 & 345 &  66 & Drop $\delta_0$; saves $1/d$ mults \\
+Centered, exact                  & 29.2 & 921 & 176 & $4\times$ noise reduction \\
+\textbf{Centered, approx}       & \textbf{28.9} & \textbf{1382} & \textbf{264} & \textbf{Default.} Best of both \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+We choose $d$ as the largest power of two $\le D_{\max}$ so that all dimensions remain powers of two.
+With $D_{\max} = 264$: $D = 256 = 2^8$.
+At the $\approx\!16$~GB/60~B target with the default $\texttt{db\_rows} = 2^{15}$, $n_{\mathrm{packed}} = 128 < D$, so the encoder operates at $D_{\mathrm{act}} = \min(D, n_{\mathrm{packed}}) = 128$ (the small-DB fallback in \Cref{alg:encode-db}), giving $c = 1$ output ciphertext.
+
+%=============================================================================
+\section{Parameter Selection}\label{sec:param-select}
+%=============================================================================
+
+%-----------------------------------------------------------------------------
+\subsection{Parameter Choice Flow}\label{sec:param-flow}
+%-----------------------------------------------------------------------------
+
+Parameters are determined in three tiers:
+
+\paragraph{Tier 1: Fixed by security and scheme design.}
+\begin{itemize}[nosep]
+    \item $n = 2048$ (lattice dimension; 128-bit security with $\log_2 q \le 54$)
+    \item $p = 65535 = 3 \cdot 5 \cdot 17 \cdot 257$ (composite, but $p\!-\!1$ fits in 16 bits, so each encoded coefficient occupies 2 bytes; see \Cref{sec:server-memory})\footnote{The IDFT encoding (\Cref{alg:inversedft}) requires only $\gcd(D, p) = 1$ (for $D^{-1} \bmod p$) and $p$ odd (so $\omega = X^{n/D}$ has order $2D$ in $\Rp$); both hold for $p = 65535$. No part of the scheme requires $p$ prime. A 16-bit prime ($p = 65521$) would work equivalently but offers no practical gain.}
+    \item $\sigma = 3.2$ (discrete Gaussian standard deviation)
+    \item Automorphism generator $= 5$
+    \item Secret key: $\chi_{\mathrm{sk}}$: uniform ternary $\{-1,0,+1\}$
+\end{itemize}
+
+\paragraph{Tier 2: Fixed by noise analysis.}
+Given Tier~1, the following are determined by the error analysis (\Cref{sec:noise}):
+\begin{itemize}[nosep]
+    \item $q = q_0 \cdot q_1$: maximize $\log_2 q$ subject to $\log_2 q \le 54$ and both $q_i \equiv 1 \pmod{2n}$
+    \item $d = 3$, $(d-1 = 2)$ effective digits (approximate centered gadget)
+    \item $B = \ceil{2^{\ceil{\log_2 q / d}}} = 2^{18}$ (gadget base)
+    \item $q'_0 = 2^{20}$, $q'_1 = 2^{28}$ (response compression; trades noise budget for wire size)
+    \item $D_{\max} = 264$ (max interpolation degree after modulus-switch noise deduction)
+    \item $D = 2^{\floor{\log_2 D_{\max}}} = 256$ (largest power-of-two $\le D_{\max}$)
+\end{itemize}
+
+\paragraph{Tier 3: Derived from database shape.}
+Given $N$ (number of entries) and $w$ (entry bytes, $\ge 2$):
+\begin{enumerate}[nosep]
+    \item $\textsc{Encode}_p$: bit-pack at $\floor{\log_2 p} = 15$ bits per coefficient (\Cref{alg:encode-db}; switch to base-$p$ digits if the residual bit matters).
+    \item $\texttt{coeffs\_per\_entry} = \ceil{8w / \floor{\log_2 p}} = \ceil{8w / 15}$.
+    \item Total coefficients: $C = N \cdot \texttt{coeffs\_per\_entry}$.
+    \item $\texttt{db\_rows} = \texttt{DEFAULT\_DB\_ROWS} = 2^{15}$ (fixed default; rationale below).
+    \item $\texttt{db\_cols} = \ceil{C / \texttt{db\_rows}}$ rounded up to a multiple of $n$.
+    \item $c = \max\bigl(1,\; \texttt{db\_cols} / (n \cdot D)\bigr)$.
+\end{enumerate}
+The implementation uses a \textbf{fixed default} $\texttt{db\_rows} = 2^{15} = 32768$ (a tall geometry), \emph{not} a communication-minimizing search over candidates.
+The reason: a smaller $\texttt{db\_rows}$ does minimize communication, but it inflates the precomputation (``hint'') memory $M_{\mathrm{precomp}}$ (\Cref{eq:mem-precomp}), which scales with $\texttt{db\_cols} = C/\texttt{db\_rows}$ and is what actually bounds the deployable database size on a fixed-memory GPU.
+The tall default keeps $M_{\mathrm{precomp}}$ small at the cost of a larger query; raise or lower $\texttt{db\_rows}$ manually to trade query size against memory (\Cref{tab:16gb-mem-tradeoff}).
+
+%-----------------------------------------------------------------------------
+\subsection{Server Memory Cost}\label{sec:server-memory}
+%-----------------------------------------------------------------------------
+
+The server keeps two data structures resident in (GPU) memory: the encoded database, and the per-group $\textsc{InspiRINGOffline}$ precomputation.
+
+\paragraph{Encoded database.}
+After the InverseDFT encoding (\Cref{alg:inversedft}), each coefficient of $\texttt{db}$ takes a value in $[0, p\!-\!1] = [0, 65534]$, which fits in 16 bits.
+With the 15-bit bit-packing of \Cref{alg:encode-db}, each entry of $w$ bytes occupies $\ceil{8w/15}$ coefficients, each stored as \texttt{u16}:
+\begin{equation}
+M_{\texttt{db}} \;=\; \texttt{db\_rows} \cdot \texttt{db\_cols} \cdot 2 \;=\; 2 N \ceil{8w/15} \;\approx\; \tfrac{16}{15}\, N w \quad \text{bytes}.
+\label{eq:mem-db}
+\end{equation}
+Compared to a raw byte-for-byte database ($Nw$), the overhead is $\approx 7\%$ from the 15-vs-16 bit slack (recoverable with the base-$p$ packing of \Cref{alg:encode-db}'s remark).
+This is a $\sim$$1.87\times$ memory reduction over the natural $p = 65537$ choice, which would have forced a 32-bit-per-coefficient layout.
+
+\paragraph{Precomputation per group.}
+Each group's $\mathsf{precomp}_g = \{a(X),\, \mathbf{D}_+,\, \mathbf{D}_-,\, \mathbf{D}_{\mathrm{final}}\}$ holds
+\begin{align*}
+\#\text{polynomials per group} &= \underbrace{1}_{a(X)} + \underbrace{2 \cdot (n/2 - 1)(d-1)}_{\mathbf{D}_+ \text{ and } \mathbf{D}_-} + \underbrace{(d-1)}_{\mathbf{D}_{\mathrm{final}}} \\
+&= 1 + (d-1)(n-1).
+\end{align*}
+Each polynomial is stored in NTT form with 2 RNS limbs of $n$ \texttt{u32} coefficients (both primes are $< 2^{28}$):
+\begin{equation}
+M_{\mathrm{group}} \;=\; \bigl[1 + (d\!-\!1)(n\!-\!1)\bigr] \cdot 2n \cdot 4 \;\approx\; 8(d\!-\!1)\, n^2 \quad \text{bytes}.
+\label{eq:mem-group}
+\end{equation}
+At $n = 2048$, $d = 3$: $M_{\mathrm{group}} = 4095 \cdot 16{,}384 \approx 64$~MiB.
+The $a(X)$ and $\mathbf{D}_{\mathrm{final}}$ terms together contribute only $3 \cdot 16$~KB, so the formula is dominated by the $(\mathbf{D}_+, \mathbf{D}_-)$ pair.
+
+\paragraph{Total precomputation.}
+With $n_{\mathrm{packed}} = \texttt{db\_cols}/n$ groups,
+\begin{equation}
+M_{\mathrm{precomp}} \;=\; n_{\mathrm{packed}} \cdot M_{\mathrm{group}} \;=\; \frac{\texttt{db\_cols}}{n} \cdot \bigl[1 + (d\!-\!1)(n\!-\!1)\bigr] \cdot 2n \cdot 4 \;\approx\; 8(d\!-\!1)\, n \cdot \texttt{db\_cols} \quad \text{bytes}.
+\label{eq:mem-precomp}
+\end{equation}
+This scales \emph{linearly with} $\texttt{db\_cols}$: increasing $\texttt{db\_rows}$ (which decreases $\texttt{db\_cols}$) saves precomputation memory at the cost of larger query.
+
+\paragraph{Total server memory.}
+\begin{equation}
+M_{\mathrm{server}} \;=\; M_{\texttt{db}} + M_{\mathrm{precomp}} \;\approx\; 2\, \texttt{db\_rows} \cdot \texttt{db\_cols} + 8(d\!-\!1)\, n \cdot \texttt{db\_cols}.
+\label{eq:mem-server}
+\end{equation}
+For typical parameters ($d\!-\!1 = 2$, $n = 2048$), the precomp term is $32{,}768 \cdot \texttt{db\_cols}$ bytes and the database term is $2 \cdot \texttt{db\_rows} \cdot \texttt{db\_cols}$ bytes; precomp dominates whenever $\texttt{db\_rows} < 4(d\!-\!1)\,n = 16{,}384$.
+
+\paragraph{Trade-off vs.\ communication.}
+Together with the communication formula~\eqref{eq:total-cost}:
+\begin{itemize}[nosep]
+    \item Small $\texttt{db\_rows}$: smaller query, more groups, large $M_{\mathrm{precomp}}$.
+    \item Large $\texttt{db\_rows}$: bigger query, fewer groups, small $M_{\mathrm{precomp}}$.
+\end{itemize}
+The Tier~3 selection in \Cref{sec:param-flow} only minimizes communication; for memory-constrained deployments, $\texttt{db\_rows}$ should be raised until $M_{\mathrm{precomp}}$ fits available device memory, even at the cost of a larger query.
+
+%-----------------------------------------------------------------------------
+\subsection{Concrete Instantiation ($\approx\!16$~GB / 60~B)}\label{sec:concrete}
+%-----------------------------------------------------------------------------
+
+The headline target keeps the database storage close to $16$~GiB and chooses the entry size $w$ for clean alignment under 15-bit packing.
+With $w = 60$ bytes per entry, $\ceil{8w/15} = 32$ coefficients per entry exactly, so $\texttt{db\_cols}$ is a power of two and no zero-padding is wasted.
+The raw database is $N \cdot w = 2^{28} \cdot 60 = 15$~GiB; the encoded $\texttt{db}$ is exactly $16$~GiB (the $16/15$ inflation from 15-bit packing).
+A more conventional $w = 64$ entry size is supported but inflates $\texttt{db\_cols}$ by $\approx 9.4\%$ ($35/32$ coefficients per entry, non-power-of-two), unless the tighter base-$p$ packing from the remark in \Cref{alg:encode-db} is used (recovers $32$ coefficients per 64~B entry).
+
+\begin{table}[ht]\centering
+\caption{Concrete parameters for the $\approx\!16$~GB target.}\label{tab:concrete}
+\begin{tabular}{@{}lrl@{}}
+\toprule
+\textbf{Parameter} & \textbf{Value} & \textbf{Tier} \\
+\midrule
+$n$                 & 2048                              & 1 (security) \\
+$q$                 & $133304321 \times 135135233$       & 2 (noise) \\
+$p$                 & 65535                              & 1 (design) \\
+$\sigma$            & 3.2                                & 1 (security) \\
+$D$                 & 256                                & 2 (noise) \\
+$q'_0, q'_1$        & $2^{20}, 2^{28}$                  & 2 (noise/comm tradeoff) \\
+\midrule
+$N$                 & $2^{28} = 268{,}435{,}456$         & Input \\
+$w$                 & 60~bytes (raw $= 15$~GiB)          & Input \\
+$\texttt{db\_rows}$ & $2^{15} = 32768$                   & 3 (fixed default) \\
+$\texttt{db\_cols}$ & $2^{18} = 262{,}144$               & 3 (derived) \\
+$n_{\mathrm{packed}}$ & $128$                            & 3 (derived) \\
+$D_{\mathrm{act}}$  & $\min(256, 128) = 128$             & 3 (derived) \\
+$c$                 & $1$                                & 3 (derived) \\
+\midrule
+Query               & 378~KB                             & \eqref{eq:query-cost} \\
+Response            & 12~KB                              & \eqref{eq:response-cost} \\
+\textbf{Comm.\ total} & \textbf{390~KB}                  & \eqref{eq:total-cost} \\
+\midrule
+$M_{\texttt{db}}$        & 16~GiB                        & \eqref{eq:mem-db} \\
+$M_{\mathrm{precomp}}$   & 8~GiB                         & \eqref{eq:mem-precomp} \\
+\textbf{Server memory}   & \textbf{24~GiB}               & \eqref{eq:mem-server} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Note: ``16~GB'' is approximate. Raw input is $15$~GiB and the encoded $\texttt{db}$ is $16$~GiB exactly because every coefficient lives in $\Z_p$ with $p = 65535$ rather than holding a full 16 bits.
+The fixed default $\texttt{db\_rows} = 2^{15}$ needs $24$~GiB of GPU memory, fitting comfortably on the target RTX~5090~(32~GB).
+\Cref{tab:16gb-mem-tradeoff} shows the full trade-off: a smaller $\texttt{db\_rows}$ cuts communication but the precomputation grows past device memory (reaching $80$~GiB at the communication-optimal $\texttt{db\_rows} = 2^{12}$), while a larger $\texttt{db\_rows}$ shrinks memory further at the cost of a bigger query.
+
+\begin{table}[ht]\centering
+\caption{Memory--communication trade-off for $\approx\!16$~GB / 60~B at varying $\texttt{db\_rows}$ (the $2^{15}$ row is the fixed default).}\label{tab:16gb-mem-tradeoff}
+\begin{tabular}{@{}rrrrrrrr@{}}
+\toprule
+$\texttt{db\_rows}$ & $\texttt{db\_cols}$ & $n_{\mathrm{packed}}$ & $c$ & \textbf{Query} & \textbf{Total comm.} & $M_{\texttt{db}}$ & $M_{\mathrm{server}}$ \\
+\midrule
+$2^{12}$  & $2^{21}$ & 1024 & 4 & 188~KB &  236~KB & 16~GiB & 80~GiB \\
+$2^{13}$  & $2^{20}$ &  512 & 2 & 216~KB &  240~KB & 16~GiB & 48~GiB \\
+$2^{14}$  & $2^{19}$ &  256 & 1 & 270~KB &  282~KB & 16~GiB & 32~GiB \\
+$\mathbf{2^{15}}$  & $\mathbf{2^{18}}$ &  \textbf{128} & \textbf{1} & \textbf{378~KB} &  \textbf{390~KB} & \textbf{16~GiB} & \textbf{24~GiB} \\
+$2^{16}$  & $2^{17}$ &   64 & 1 & 594~KB &  606~KB & 16~GiB & 20~GiB \\
+$2^{20}$  & $2^{13}$ &    4 & 1 & 7.4~MB &  7.4~MB & 16~GiB & $\approx 16$~GiB \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[ht]\centering
+\caption{Other database configurations (same Tier~1/2 parameters; $w$ chosen for clean 15-bit alignment).}\label{tab:db-configs-other}
+\begin{tabular}{@{}rrrrrrrrr@{}}
+\toprule
+\textbf{DB} & \textbf{Entry} & $N$ & $\texttt{db\_rows}$ & $n_{\mathrm{packed}}$ & $c$ & \textbf{Total comm.} & $M_{\texttt{db}}$ & $M_{\mathrm{server}}$ \\
+\midrule
+$\approx\!1$~GB  & 240~B & $2^{22}$ & $2^{15}$ &    8 & 1 & 390~KB &  1~GiB & 1.5~GiB \\
+$\approx\!8$~GB  &  60~B & $2^{27}$ & $2^{15}$ &   64 & 1 & 390~KB &  8~GiB &  12~GiB \\
+$\approx\!16$~GB &  60~B & $2^{28}$ & $2^{15}$ &  128 & 1 & 390~KB & 16~GiB &  24~GiB \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%=============================================================================
+\section{Implementation Notes}\label{sec:impl}
+%=============================================================================
+
+%-----------------------------------------------------------------------------
+\subsection{RNS / CRT Arithmetic}
+%-----------------------------------------------------------------------------
+
+With $q = q_0 \cdot q_1$ (two NTT-friendly primes, both $< 2^{28}$), all polynomial arithmetic splits into two independent limbs.
+The first-dimension dot product multiplies \texttt{u16} DB entries by \texttt{u64} query values per limb.
+Each limb product is $\le 2^{28} \cdot 2^{16} = 2^{44}$; summing $\texttt{db\_rows}$ of them ($2^{15}$ at the default) gives $\le 2^{59}$, which fits in \texttt{u64}.
+
+%-----------------------------------------------------------------------------
+\subsection{GPU: CUDA Kernels}\label{sec:cuda}
+%-----------------------------------------------------------------------------
+
+All polynomial arithmetic runs on the GPU via custom CUDA kernels.
+The NTT is the most critical kernel, as it dominates key switching and external product costs.
+
+\paragraph{NTT kernel design.}
+We implement a radix-2 Cooley--Tukey NTT with two phases:
+\begin{enumerate}[nosep]
+    \item \textbf{Global phase} (stages $\log_2 n$ down to $\log_2 S$):
+    Each butterfly spans more elements than fit in shared memory.
+    Threads read/write global memory with coalesced access patterns.
+    One thread block handles one (polynomial, RNS limb) pair for each stage.
+
+    \item \textbf{Shared-memory phase} (stages $\log_2 S$ down to $1$):
+    Once the working set fits in shared memory ($S = 1024$ or $2048$ elements), load a contiguous segment, perform all remaining butterfly stages in shared memory, write back.
+    This eliminates global memory round-trips for the fine-grained stages.
+\end{enumerate}
+
+\paragraph{Modular arithmetic.}
+Both primes fit in 28 bits.
+Coefficients are stored as native \texttt{u32}; products of two coefficients fit in \texttt{u64}; sums of $d{-}1 = 2$ such products fit in $\texttt{u55}$.
+We reduce a $\texttt{u55}$ accumulator $x$ modulo $q_c$ using a precomputed Barrett constant $\mu_c = \lfloor 2^{55} / q_c \rfloor < 2^{29}$:
+\[
+t \gets ((x \gg 27) \cdot \mu_c) \gg 28, \qquad r \gets x - t \cdot q_c, \qquad \text{up to two corrections } r \mathrel{-}= q_c.
+\]
+This avoids the GPU's slow 64-bit integer division entirely and runs in a handful of \texttt{u32} multiplies and shifts.
+Add/Sub use \texttt{u32} with conditional subtraction.
+
+\paragraph{Twiddle factors.}
+At initialization, find a primitive $2n$-th root of unity $\psi_c \in \Z_{q_c}$ for each RNS prime (test successive small generators against $\psi_c^n \equiv -1 \pmod{q_c}$), then precompute the bit-reversed power table $\{\psi_c^{\mathrm{br}(i)} \bmod q_c\}_{i=0}^{n-1}$ on the host and copy to the device once.
+One $n$-element \texttt{u32} array per RNS limb (16 KB total at $n = 2048$); resident in device global memory and read through L2/constant cache during NTTs.
+
+\paragraph{Kernel fusion.}
+Where possible, fuse consecutive operations into single kernel launches to avoid global memory round-trips:
+\begin{itemize}[nosep]
+    \item \textbf{NTT + element-wise multiply + INTT}: ring multiplication in one kernel.
+    \item \textbf{Gadget decompose + NTT + multiply-accumulate}: key-switch step in one kernel (the bottleneck of InspiRING Collapse).
+    \item \textbf{INTT + extract coefficients}: LWE extraction fused with INTT.
+\end{itemize}
+
+\begin{table}[ht]\centering
+\caption{CUDA kernel summary.}\label{tab:cuda}
+\begin{tabular}{@{}lll@{}}
+\toprule
+\textbf{Kernel} & \textbf{Parallelism} & \textbf{Notes} \\
+\midrule
+NTT / INTT          & 1 block per (poly, limb) & 2-phase: global + shared memory \\
+Ring multiply        & 1 block per (poly, limb) & Fused NTT $\to$ elt-wise $\to$ INTT \\
+First-dim dot prod   & 1 block per column       & \texttt{u16} $\times$ \texttt{u32} per limb \\
+Key-switch step      & 1 block per (step, limb) & Fused decomp + NTT + mul-acc \\
+Gadget decompose     & Grid over coefficients   & Centered, carry propagation \\
+External product     & Per-ciphertext           & Fuse $2(d\!-\!1)$ decomp + mul-acc \\
+Modulus switch       & Grid over coefficients   & Round + rescale \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%=============================================================================
+\section{Optimizations vs.\ Reference Implementation}\label{sec:optimizations}
+%=============================================================================
+
+The following optimizations are introduced in \texttt{inspire-gpu} compared to the reference Rust implementation built on \texttt{spiral-rs}~\cite{inspire2025,spiral}.
+
+\begin{table}[ht]\centering
+\caption{Optimization summary.}\label{tab:optimizations}
+\renewcommand{\arraystretch}{1.3}
+\begin{tabular}{@{}p{3.8cm}p{3.5cm}p{5.5cm}@{}}
+\toprule
+\textbf{Optimization} & \textbf{Impact} & \textbf{Details} \\
+\midrule
+Approx.\ centered gadget (default) &
+$D_{\max}$: $34 \to 264$; $1/d$ fewer poly mults &
+Centered digits ($[-B/2, B/2)$, $4\times$ noise reduction) + drop least significant digit (residual $\le B/2 \approx 2^{17}$ negligible).
+Reduces RGSW to $4(d\!-\!1)=8$ cts, key-switching keys to $2(d\!-\!1)=4$ cts (\Cref{alg:gadget}). \\
+
+Optimized prime selection &
+$\log_2 q = 54.00$ (vs.\ 52.97) &
+Primes $133304321 \times 135135233$ maximize $q$ under the $\log_2 q \le 54$ constraint. Gives $+1$ bit noise budget vs.\ reference primes $67043329 \times 132120577$. \\
+
+$\sigma = 3.2$ (vs.\ 6.4) &
+$2\times$ noise reduction &
+Standard HE noise width. Reference used $\sigma = 6.4$; reducing to $3.2$ halves all Gaussian noise terms while maintaining security (validated by lattice estimator for $n = 2048$). \\
+
+CUDA kernels (32-bit Barrett) &
+GPU: native \texttt{u32} arithmetic &
+Both primes fit in 28 bits. All modular reductions use a precomputed Barrett constant ($\mu_c = \lfloor 2^{55}/q_c \rfloor$), avoiding 64-bit division. Fused NTT + key-switch kernels avoid global memory round-trips. \\
+
+Coalesced row-major mat-vec &
+GPU: $\sim 480$ GB/s on A40 &
+Database transposed to row-major at preprocess; mat-vec kernel with one thread per output column achieves coalesced reads, within 1--6\% of pure memory-read bandwidth (\Cref{sec:cuda}).
+Auto-dispatch falls back to a parallel-reduction variant when the column count is too small to saturate the GPU. \\
+
+Lazy InspiRINGOnline &
+Eliminates ExpandKSK$_b$ &
+The conjugate and forward halves' expanded keys $\mathsf{K}_+,\mathsf{K}_-$ are derived from the same $\mathsf{ksk}_5^{(b)}$ by NTT-domain index permutation.
+We permute on the fly inside the collapse kernel rather than materialize the expanded keys, saving $\approx 128$~MB of device memory per query and $\approx 60$--80~ms of host-side expansion. \\
+
+Multi-group mega-kernel &
+$n_p$ Collapses in one launch &
+All $n_p \cdot 4$ collapse half-kernels (forward/conjugate $\times$ two RNS limbs) launched as a single CUDA grid with $\texttt{blockIdx.y}$ ranging over groups, eliminating per-group launch overhead. \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+%=============================================================================
+\begin{thebibliography}{9}
+
+\bibitem{inspire2025}
+R.~Akhavan~Mahdavi, S.~Patel, J.~Y.~Seo, K.~Yeo.
+{InsPIRe}: Communication-Efficient {PIR} with Silent Preprocessing.
+\emph{IEEE S\&P}, 2026. ePrint 2025/1352.
+
+\bibitem{spiral}
+S.~Menon, D.~J.~Wu.
+{Spiral}: Fast, High-Rate Single-Server {PIR} via {FHE} Composition.
+\emph{IEEE S\&P}, 2022.
+
+\bibitem{ypir}
+S.~Menon, D.~J.~Wu.
+{YPIR}: High-Throughput Single-Server {PIR} with Silent Preprocessing.
+\emph{USENIX Security}, 2024.
+
+\bibitem{seal}
+Microsoft SEAL (release 4.1).
+\url{https://github.com/microsoft/SEAL}, 2023.
+
+\bibitem{bfv}
+J.~Fan, F.~Vercauteren.
+Somewhat Practical Fully Homomorphic Encryption.
+ePrint 2012/144.
+
+\end{thebibliography}
+
+\end{document}

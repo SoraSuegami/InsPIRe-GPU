@@ -1,0 +1,14 @@
+build/
+*.o
+*.a
+*.so
+*.d
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+compile_commands.json
+docs/*.aux
+docs/*.log
+docs/*.out
+docs/*.toc
+docs/scheme_description_inspire2.*
