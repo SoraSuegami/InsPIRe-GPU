@@ -119,7 +119,7 @@ and do not affect any other entry's result.
 Queries from independent clients batched together share the two big data
 passes (one over the database, one over the
 precomputed tensors) and advance their polynomial evaluations in step:
-from 32 to 115 q/s at 16 GB on one card (see the benchmark table). Per-query
+from 31.2 to 233.4 q/s at 16 GB on one card (see the benchmark table). Per-query
 scratch buffers are pre-allocated at setup (`cfg.max_batch`); nothing is
 allocated on the request path, and `gpu_server_caps` publishes the limits
 for the caller's scheduler:

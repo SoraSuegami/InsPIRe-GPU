@@ -110,10 +110,9 @@ struct GpuServerCtx {
     uint32_t *d_fwd_q1, *d_inv_q1;
     uint32_t inv_n_q0, inv_n_q1;
 
-    // DB (row-major u16): gpu_preprocess produces it row-major; adopted directly. Phase 14: P=65535 / 15-bit
-    // packing, each slot fits in uint16_t.
-    // Encoded DB, row-major (db[row*db_cols+col]) — the layout gpu_encode produces
-    // and the online matvec reads directly (no transpose, single resident copy).
+    // DB allocation, row-major: preprocessing writes P=65535 slot values as
+    // uint16_t, then server setup centers both bytes in place for matvec. The
+    // allocation stays typed as uint16_t for ownership compatibility.
     uint16_t* d_db_rm;
     size_t db_rows, db_cols, n_packed;
 
@@ -1276,7 +1275,8 @@ static std::vector<RlweCt> answer_one(GpuServerCtx* ctx, QuerySlot& slot,
     // ===== Step 1: Mat-vec on GPU =====
     if (!skip_matvec) {
         upload_query_b(ctx, slot, qry);
-        // Phase 14: DB is row-major u16; the dual-limb matvec reads it directly.
+        // Setup converts the row-major DB in place to centered bytes; matvec
+        // reconstructs both RNS limbs exactly from that representation.
         if (pp.db_rows >= 32768) {
             inspire::gpu::gpu_matvec_centered_packed(
                 slot.d_packed_b, slot.d_packed_b,
@@ -1444,7 +1444,8 @@ static std::vector<RlweCt> answer_one(GpuServerCtx* ctx, QuerySlot& slot,
 // B3: pack all groups for `count` slots with the batched collapse kernels —
 // each group's precomp tensor is streamed once and applied to every query.
 // Preconditions: every slot's d_packed_b holds its matvec output and its
-// keys are uploaded (upload_ksks). Postcondition: slot.d_packed_{a,b} filled.
+// keys are uploaded (upload_ksks). Postcondition: each slot's d_packed_b is
+// filled; the query-independent a-side remains shared in ctx->d_packed_a.
 static void batched_pack(GpuServerCtx* ctx, size_t count) {
     const PublicParams& pp = ctx->pp;
     const size_t n_steps = N / 2 - 1;
@@ -1460,7 +1461,7 @@ static void batched_pack(GpuServerCtx* ctx, size_t count) {
         const size_t off_q0 = g * 2 * N;
         const size_t off_q1 = off_q0 + N;
 
-        // Per-query b-poly prep (copy + NTT) on this group's stream.
+        // Transform each query's b polynomial in place on this group's stream.
         for (size_t b = 0; b < count; b++) {
             QuerySlot& sl = ctx->slots[b];
             uint32_t* d_b_q0 = sl.d_packed_b + off_q0;
