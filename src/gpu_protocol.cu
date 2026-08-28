@@ -1336,11 +1336,8 @@ static std::vector<RlweCt> answer_one(GpuServerCtx* ctx, QuerySlot& slot,
                             cudaMemcpyDeviceToDevice, s);
             fine_end(fi, s);
         }
-        // Join stream work on the default stream without blocking the host.
-        for (size_t i = 0; i < ctx->streams.size(); i++) {
-            CUDA_CHECK(cudaEventRecord(ctx->stream_done_events[i], ctx->streams[i]));
-            CUDA_CHECK(cudaStreamWaitEvent(0, ctx->stream_done_events[i], 0));
-        }
+        // Ensure every packed polynomial is ready before Horner consumes it.
+        for (auto s : ctx->streams) CUDA_CHECK(cudaStreamSynchronize(s));
         mark("collapse all groups");
     }
 
@@ -1457,10 +1454,7 @@ static void batched_pack(GpuServerCtx* ctx, size_t count) {
                             2 * N * sizeof(uint32_t), cudaMemcpyDeviceToDevice, s);
         }
     }
-    for (size_t i = 0; i < ctx->streams.size(); i++) {
-        CUDA_CHECK(cudaEventRecord(ctx->stream_done_events[i], ctx->streams[i]));
-        CUDA_CHECK(cudaStreamWaitEvent(0, ctx->stream_done_events[i], 0));
-    }
+    for (auto s : ctx->streams) CUDA_CHECK(cudaStreamSynchronize(s));
 }
 
 std::vector<RlweCt> gpu_answer(GpuServerCtx* ctx, const QueryMessage& qry) {
