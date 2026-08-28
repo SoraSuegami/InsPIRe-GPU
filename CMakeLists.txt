@@ -47,14 +47,16 @@ target_link_libraries(inspire PUBLIC OpenSSL::Crypto)
 
 # GPU library
 if(NOT INSPIRE_CLIENT_ONLY)
+find_package(CUDAToolkit REQUIRED)
 add_library(inspire_gpu
     src/gpu_primitives.cu      # NTT, decomp, poly ops, mem/init (phase-agnostic)
     src/gpu_preprocess.cu      # encode, a-side matmul, ring_embed, automorphism, collapse_fused
+    src/gpu_matvec_tensor.cu   # centered-INT8 tensor-core matrix-vector/matrix path
     src/gpu_online.cu          # matvec, lazy_collapse, ext_prod, horner, fused_ip_sub
     src/gpu_protocol.cu        # orchestration: GpuServerCtx, gpu_preprocess/setup_server/answer(_batch)
     src/capi.cu)               # C ABI facade for FFI consumers (see src/capi.h)
 target_include_directories(inspire_gpu PUBLIC src)
-target_link_libraries(inspire_gpu PUBLIC inspire)
+target_link_libraries(inspire_gpu PUBLIC inspire CUDA::cublas)
 endif()
 
 # ------------------------------------------------------------------
@@ -75,6 +77,7 @@ inspire_add_test(test_crypto  tests/test_crypto.cpp)
 # GPU per-kernel tests (bit-exact vs CPU oracle)
 if(NOT INSPIRE_CLIENT_ONLY)
 inspire_add_test(test_gpu_ntt        tests/test_gpu_ntt.cu        inspire_gpu)
+inspire_add_test(test_gpu_matvec_tensor tests/test_gpu_matvec_tensor.cu inspire_gpu)
 inspire_add_test(test_gpu_decomp     tests/test_gpu_decomp.cu     inspire_gpu)
 inspire_add_test(test_gpu_extprod    tests/test_gpu_extprod.cu    inspire_gpu)
 inspire_add_test(test_gpu_horner     tests/test_gpu_horner.cu     inspire_gpu)

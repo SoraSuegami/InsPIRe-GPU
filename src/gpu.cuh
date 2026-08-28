@@ -2,6 +2,8 @@
 #include <cstdint>
 #include <cstddef>
 #include <vector>
+#include <cuda_runtime.h>
+#include <cublas_v2.h>
 
 namespace inspire {
 namespace gpu {
@@ -212,6 +214,26 @@ void gpu_collapse_fused(
 // ============================================================
 // ONLINE (gpu_online.cu) — per-query answer hot path
 // ============================================================
+
+// Convert the encoded row-major u16 DB in place to centered signed bytes.
+// The allocation size is unchanged: each u16 becomes interleaved low/high
+// int8 digits.  The resulting memory is a column-major (2*db_cols) x db_rows
+// INT8 matrix without a transpose or a second resident DB copy.  byte_sums
+// contains the per-matrix-row signed sums needed to undo centering exactly.
+void gpu_matvec_tensor_prepare_db(uint16_t* d_db_rm, int32_t* d_byte_sums,
+                                  size_t db_rows, size_t db_cols);
+
+// Tensor-core batched mat-vec.  A single INT8 GEMM handles every query and
+// both RNS limbs.  Each uint32 query residue is decomposed into four centered
+// byte planes; the correction/recomposition kernel writes ordinary q0/q1
+// results, bit-exact with the scalar modular dot product.
+void gpu_matvec_tensor_batched(
+    uint32_t* const* d_results0, uint32_t* const* d_results1,
+    const uint16_t* d_centered_db, const int32_t* d_db_byte_sums,
+    const uint32_t* const* d_queries0, const uint32_t* const* d_queries1,
+    int8_t* d_query_planes, int32_t* d_query_sums, int32_t* d_gemm_out,
+    size_t db_rows, size_t db_cols, uint32_t q0, uint32_t q1,
+    int batch, cublasHandle_t handle);
 
 // Dual-limb mat-vec: reads u16 DB once, computes both RNS limbs in one pass.
 // Dispatches between a "wide" simple kernel (db_cols >> db_rows) and a tall

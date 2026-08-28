@@ -308,10 +308,10 @@ void gpu_ext_prod(
     uint32_t* b1_coeff = d_scratch_coeff + 3*n;
 
     // Step 1: INTT each limb of ct_a, ct_b → coeff form (batched per modulus).
-    CUDA_CHECK(cudaMemcpy(a0_coeff, d_ct_a,         n * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
-    CUDA_CHECK(cudaMemcpy(b0_coeff, d_ct_b,         n * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
-    CUDA_CHECK(cudaMemcpy(a1_coeff, d_ct_a + n,     n * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
-    CUDA_CHECK(cudaMemcpy(b1_coeff, d_ct_b + n,     n * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
+    CUDA_CHECK(cudaMemcpyAsync(a0_coeff, d_ct_a,     n * sizeof(uint32_t), cudaMemcpyDeviceToDevice, 0));
+    CUDA_CHECK(cudaMemcpyAsync(b0_coeff, d_ct_b,     n * sizeof(uint32_t), cudaMemcpyDeviceToDevice, 0));
+    CUDA_CHECK(cudaMemcpyAsync(a1_coeff, d_ct_a + n, n * sizeof(uint32_t), cudaMemcpyDeviceToDevice, 0));
+    CUDA_CHECK(cudaMemcpyAsync(b1_coeff, d_ct_b + n, n * sizeof(uint32_t), cudaMemcpyDeviceToDevice, 0));
     // Batched INTT via the primitives wrapper (1024 threads): [a0,b0] / [a1,b1].
     gpu_ntt_inverse_batch(a0_coeff, n, 2, Q0, d_inv_twiddles_q0, inv_n_q0, 1024);
     gpu_ntt_inverse_batch(a1_coeff, n, 2, Q1, d_inv_twiddles_q1, inv_n_q1, 1024);
@@ -491,8 +491,10 @@ void gpu_horner_eval(
     auto new_ev = [&]() { cudaEvent_t e; cudaEventCreate(&e); return e; };
 
     // Initialize: acc = packed[D-1]
-    CUDA_CHECK(cudaMemcpy(d_acc_a, d_packed_a + (D-1) * 2 * n, 2 * n * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
-    CUDA_CHECK(cudaMemcpy(d_acc_b, d_packed_b + (D-1) * 2 * n, 2 * n * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
+    CUDA_CHECK(cudaMemcpyAsync(d_acc_a, d_packed_a + (D-1) * 2 * n,
+                               2 * n * sizeof(uint32_t), cudaMemcpyDeviceToDevice, 0));
+    CUDA_CHECK(cudaMemcpyAsync(d_acc_b, d_packed_b + (D-1) * 2 * n,
+                               2 * n * sizeof(uint32_t), cudaMemcpyDeviceToDevice, 0));
 
     for (int i = D - 2; i >= 0; i--) {
         if (fine) { ev0.push_back(new_ev()); cudaEventRecord(ev0.back(), 0); }
