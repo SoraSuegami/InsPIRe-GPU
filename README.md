@@ -71,8 +71,9 @@ caller's (or a wrapper repo's) responsibility, by design:
   The wire encodings themselves are provided in `capi.h` (see the API
   section).
 
-Deferred, not implemented: tensor-core mat-vec is the main remaining speed
-lever.
+The GPU server uses an exact centered-INT8 Tensor Core mat-vec for larger
+batches and exact scalar kernels for small batches or geometries outside the
+safe INT32 accumulation bound.
 
 ## API
 
@@ -118,7 +119,7 @@ and do not affect any other entry's result.
 Queries from independent clients batched together share the two big data
 passes (one over the database, one over the
 precomputed tensors) and advance their polynomial evaluations in step:
-from 32 to 115 q/s at 16 GB on one card (see the benchmark table). Per-query
+from 31.3 to 232.9 q/s at 16 GB on one card (see the benchmark table). Per-query
 scratch buffers are pre-allocated at setup (`cfg.max_batch`); nothing is
 allocated on the request path, and `gpu_server_caps` publishes the limits
 for the caller's scheduler:
@@ -157,11 +158,11 @@ at the default geometry `db_rows = 32768`.
 
 Median of 5 trials:
 
-| Database | Number of entries | Per-query latency | Communication (↑query + ↓resp) | Resident memory (precomp + DB) | Preprocessing |
+| Database | Number of entries | Per-query latency | Communication (↑query + ↓resp) | Resident memory (precomp + DB) | Setup (preprocess + server) |
 |---|---|---|---|---|---|
-| **1 GB**  | 2²³ | **~2.6 ms** | 383 KB (371 + 12) | 1.61 GB  | ~3.3 s |
-| **4 GB**  | 2²⁵ | **~7.9 ms** | 383 KB             | 6.44 GB  | ~4.0 s |
-| **16 GB** | 2²⁷ | **~31 ms**  | 383 KB             | 25.77 GB | ~7.7 s |
+| **1 GB**  | 2²³ | **2.07 ms** | 383 KB (371 + 12) | 1.61 GB  | 2.1 s |
+| **4 GB**  | 2²⁵ | **8.19 ms** | 383 KB             | 6.44 GB  | 2.4 s |
+| **16 GB** | 2²⁷ | **32.12 ms** | 383 KB            | 25.77 GB | 5.1 s |
 
 ### Batched throughput
 
@@ -169,17 +170,17 @@ Median of 5 trials:
 
 | Batch | Batch latency | Per-query | Throughput |
 |---|---|---|---|
-| B=1  | 31.1 ms  | 31.1 ms | 32 q/s |
-| B=2  | 34.4 ms  | 17.2 ms | 58 q/s |
-| B=4  | 44.4 ms  | 11.1 ms | 90 q/s |
-| B=8  | 76.7 ms  | 9.6 ms  | 104 q/s |
-| B=16 | 143.4 ms | 9.0 ms  | 112 q/s |
-| B=32 | 278.5 ms | 8.7 ms  | **115 q/s** |
+| B=1  | 31.92 ms  | 31.92 ms | 31.3 q/s |
+| B=2  | 34.97 ms  | 17.49 ms | 57.2 q/s |
+| B=4  | 36.77 ms  | 9.19 ms  | 108.8 q/s |
+| B=8  | 48.34 ms  | 6.04 ms  | 165.5 q/s |
+| B=16 | 73.37 ms  | 4.59 ms  | 218.1 q/s |
+| B=32 | 137.41 ms | 4.29 ms  | **232.9 q/s** |
 
-Batching reaches **258 q/s** at 4 GB and **579 q/s** at 1 GB. All sizes fit
-and run on a single 32 GB card (peak 29.4 GB at 16 GB). The remaining
-per-query wall is the mat-vec stage, about 70% of the batched per-query
-cost; tensor-core INT8 mat-vec is the main untapped lever.
+Batching reaches **818.8 q/s** at 4 GB and **2,268.2 q/s** at 1 GB. All sizes
+fit and run on a single 32 GB card. Larger batches use one exact INT8 GEMM for
+all queries and both RNS limbs, while small batches retain the lower-overhead
+scalar path.
 
 Client-side costs are CPU-only: building a query takes ~31 ms, and packing,
 compression, and extraction each cost a few milliseconds or less.
@@ -214,8 +215,9 @@ remote GPU server.
 
 ## Build & run
 
-The only external dependency is **OpenSSL** (SHAKE-256 for CRS seed
-expansion); the NTT is implemented in this repo, not an external library.
+The CPU/client library depends only on **OpenSSL** (SHAKE-256 for CRS seed
+expansion). The GPU server additionally requires the CUDA Toolkit and
+**cuBLAS**. The NTT is implemented in this repo, not an external library.
 
 ```bash
 cmake -S . -B build && cmake --build build -j
@@ -281,4 +283,3 @@ communication the scarce resource, especially with a GPU doing the
 computation, yet it cannot be pushed arbitrarily low for exactly that
 reason; `db_rows = 2^15` is the point where the precomputed data is about
 half the database itself, which we judged the right memory blowup.
-

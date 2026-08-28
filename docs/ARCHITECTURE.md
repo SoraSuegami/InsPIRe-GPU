@@ -33,7 +33,7 @@ holding itself to two standards:
 - Application layer (cuckoo hashing, keyword PIR, Ethereum integration) — out of scope.
 - Database update / live-fold pipeline (sidecar). Out of scope for v1.
 
-## 2. Status (numbers measured 2026-08-24, RTX 5090 — RunPod, Xeon Gold 6530 host)
+## 2. Status (numbers measured 2026-08-28, RTX 5090 — RunPod)
 
 ### Geometry and residency
 
@@ -42,9 +42,9 @@ size (1 GB → n_packed=8, 4 GB → 32, 16 GB → 128); `setup(N, w, db_rows)` o
 There is no objective/auto-selection — just the fixed default plus the override.
 The database is
 **row-major, supplied as slot values**: `db_rows × db_cols` plaintext
-values in `[0, P)` (no raw byte DB), encoded in place (inverse-DFT only), and
-stored row-major so the online mat-vec reads it directly — **no transpose, one
-resident copy.** 16 GB fits in 32 GB because there is a single row-major DB copy
+values in `[0, P)` (no raw byte DB), encoded in place (inverse-DFT only), then
+converted in place to centered byte planes for online mat-vec — **no transpose,
+one resident copy.** 16 GB fits in 32 GB because there is a single row-major DB copy
 (a column-major encode + GPU transpose would need two copies = ~43 GB).
 
 ### Single-query latency (`bench_e2e`, warm, median of 5)
@@ -56,20 +56,15 @@ latencies.
 
 | DB | per-query latency | comm (query↑ + resp↓) | hint (precomp + DB resident) | setup |
 |---|---|---|---|---|
-| **1 GB** (2²³ items) | **~2.5 ms** | 383 KB (371 + 12) | 1.61 GB | ~3.1 s |
-| **4 GB** (2²⁵ items) | **~7.8 ms** | 383 KB | 6.44 GB | ~3.0 s |
-| **16 GB** (2²⁷ items) | **~31 ms** | 383 KB | 25.77 GB | ~6.1 s |
+| **1 GB** (2²³ items) | **2.07 ms** | 383 KB (371 + 12) | 1.61 GB | 2.1 s |
+| **4 GB** (2²⁵ items) | **8.19 ms** | 383 KB | 6.44 GB | 2.4 s |
+| **16 GB** (2²⁷ items) | **32.12 ms** | 383 KB | 25.77 GB | 5.1 s |
 
 Both communication directions are real wire bytes now: queries are 53-bit
 CRT-packed (`ipir_query_pack`), responses are modulus-switched to q'
 (`ipir_response_compress`, 12,288 B per ciphertext).
 
-(The same suite on an AMD EPYC 7543 host measures 3.2 / 8.7 / ~36 ms; the
-two hosts agree within the ±20% gate.)
-
 Comm is constant (db_rows fixed); latency and hint scale with `n_packed`.
-Single-query phase split at 16 GB: mat-vec ~14.5 ms, collapse ~9 ms, horner
-~10.5 ms.
 
 ### Batched throughput (`gpu_answer_batch`, median of 3)
 
@@ -80,15 +75,16 @@ collapse, and a lockstep Horner whose launch count is independent of B.
 
 | 16 GB DB | batch latency | per-query | throughput |
 |---|---|---|---|
-| B=1 | 31.0 ms | 31.0 ms | 32 q/s |
-| B=4 | 42.4 ms | 10.6 ms | 94 q/s |
-| B=8 | 74.7 ms | 9.3 ms | 107 q/s |
-| B=16 | 138.8 ms | 8.7 ms | 115 q/s |
-| B=32 | 263.3 ms | 8.2 ms | 122 q/s |
+| B=1 | 31.92 ms | 31.92 ms | 31.3 q/s |
+| B=2 | 34.97 ms | 17.49 ms | 57.2 q/s |
+| B=4 | 36.77 ms | 9.19 ms | 108.8 q/s |
+| B=8 | 48.34 ms | 6.04 ms | 165.5 q/s |
+| B=16 | 73.37 ms | 4.59 ms | 218.1 q/s |
+| B=32 | 137.41 ms | 4.29 ms | 232.9 q/s |
 
-1 GB: 402 q/s (B=1) → **619 q/s** (B=16). The curve is at its asymptote by
-B≈16: the remaining per-query wall is the batched mat-vec tile (INT32
-compute-bound, ~5.8 ms/query at 16 GB), not batch width — see §9.
+At B=32, throughput reaches **818.8 q/s** at 4 GB and **2,268.2 q/s** at
+1 GB. Larger batches use one exact centered-INT8 GEMM for all queries and
+both RNS limbs; small batches retain the lower-overhead scalar path.
 
 ### Response-noise margin (bench_e2e noise section, measured)
 
@@ -215,8 +211,8 @@ The library is **GPU-only on the server side**; the CPU code is just the client
 - **C++17**, `-O3 -march=native` in Release. `CMAKE_EXPORT_COMPILE_COMMANDS=ON` for tooling.
 - **CUDA**: `CMAKE_CUDA_ARCHITECTURES` defaults to **`"120"`** (RTX 5090 / Blackwell);
   override with `-DCMAKE_CUDA_ARCHITECTURES=86` (or any list) when targeting other GPUs.
-- **OpenSSL** for SHAKE-256 seed expansion (`EVP_shake256`) — the only external
-  runtime dep.
+- **OpenSSL** for SHAKE-256 seed expansion (`EVP_shake256`).
+- **cuBLAS** from the CUDA toolkit for the exact centered-INT8 Tensor Core mat-vec.
 - **In-tree NTT.** The scalar NTT (`src/ntt.{h,cpp}`) is the only NTT impl on the
   CPU side; it shares the same algorithm and twiddle layout as the GPU NTT
   (`get_ntt_twiddles()` exports the GPU-friendly tables).
@@ -236,10 +232,11 @@ ctest --test-dir build --output-on-failure
 - **Conversion is a narrow cast at upload time** — the CPU stores `uint64_t` (a
   historical layout choice); the GPU narrows to `uint32_t` at upload. Never
   round-tripped in the hot path.
-- **Encoded DB on GPU**: row-major `uint16_t[db_rows × db_cols]` (`db[row*db_cols+col]`),
-  P=65535, 15-bit-per-slot packing. `gpu_encode_inverse_dft` writes it row-major directly; the
-  online mat-vec reads it as-is (no transpose, single resident copy). The DB is
-  supplied as plaintext slot values in `[0, P)`, not raw bytes.
+- **Encoded DB on GPU**: `gpu_encode_inverse_dft` writes row-major P=65535
+  `uint16_t[db_rows × db_cols]`, then `gpu_setup_server` centers its two bytes
+  in place. Online mat-vec reads those interleaved signed byte planes directly
+  (no transpose, single resident copy). The input is plaintext slot values in
+  `[0, P)`, not raw bytes.
 
 Key types:
 
@@ -249,7 +246,7 @@ Key types:
 | `RnsPoly`, `RlweCt` | `ring.h` | Value types; std::vector-based. |
 | `LweQuery`, `Ksk`, `RgswCt` | `crypto.h` | Per-query messages (client side). |
 | `QueryState`, `QueryMessage` | `protocol.h` | Client output of `query()`. |
-| `PreprocessData` | `protocol.h` | Server-side. After `gpu_preprocess`, holds `d_db_col` (the device-resident **row-major** u16 DB — name is legacy) and `d_precomp_*` (per-group device pointers). |
+| `PreprocessData` | `protocol.h` | Server-side. After `gpu_preprocess`, holds `d_db_col` (the device-resident row-major u16 DB — name is legacy) and `d_precomp_*`; setup adopts and centers the DB allocation. |
 | `GpuServerCtx` | opaque, in `gpu_protocol.cu` | Long-lived GPU state. Owns DB, precomp, twiddles, per-query scratch, streams. |
 
 Invariants:
@@ -300,7 +297,7 @@ are documented in the header and round-tripped by `test_capi`.
 ### `gpu_preprocess` — one-time work
 
 ```
-encode: upload row-major slot DB (one u16 copy) + in-place inverse-DFT (no byte-pack, no transpose)
+encode: upload row-major slot DB (one u16 copy) + in-place inverse-DFT (no transpose)
 CRS derivation (4 CRS polys, CPU NTT)
 GpuRingEmbedHelper init: build mono32 table (CPU NTT × 4096 polys → upload)
 GpuCollapseHelper init: SHAKE256 + upload + GPU NTT + batched perm → device KSK
@@ -312,19 +309,19 @@ per-group loop:
 batched collapse: one kernel launch covering all groups (Phase 10)
 ```
 
-Preprocess total at the default geometry (db_rows=32768): ~2.6 s @ 1 GB, ~2.9 s
-@ 4 GB, ~5.8 s @ 16 GB. The row-major encode (upload one u16 copy + in-place
-inverse-DFT, coalesced) replaced the old byte-pack + column-major encode + GPU
-transpose; it is both lower-memory (one DB copy) and faster.
+Setup total (preprocess plus server context) at the default geometry
+(`db_rows=32768`): 2.1 s @ 1 GB, 2.4 s @ 4 GB, and 5.1 s @ 16 GB. The
+row-major encode (upload one u16 copy + in-place
+inverse-DFT, coalesced), followed by in-place byte centering during server setup,
+keeps one DB allocation and avoids a transpose.
 
 ### `gpu_answer` — per query
 
 ```
-upload query b → matvec → upload + NTT KSK_b
+upload query b → dispatched exact matvec → upload + NTT KSK_b and upload RGSW
 for each group (streams round-robin):
     lazy_collapse_stream × {fwd, conj} × {limb 0, limb 1}
     fused_ip_sub_stream × {limb 0, limb 1}
-upload RGSW
 horner_eval D
 download response
 ```
@@ -332,40 +329,28 @@ download response
 ### `gpu_answer_batch` — B queries, three stages
 
 ```
-Stage 1  upload all b vectors; batched mat-vec (register tiles of 4 share one
-         DB stream) on wide geometries, per-query row-split dispatch on tall
-Stage 2  upload + NTT all KSKs; batched pack: per group, the precomp tensor
+Stage 1  upload all b vectors; use one exact centered-INT8 Tensor Core GEMM
+         for larger batches, with scalar dispatch for small or unsafe shapes
+Stage 2  upload + NTT all KSKs and upload RGSWs; batched pack: per group, the precomp tensor
          streams ONCE while register tiles of up to 8 apply it to every
          query's b-side (per-(stream,slot) partials pool)
-Stage 3  upload RGSWs; lockstep batched Horner: all chains advance the same
+Stage 3  lockstep batched Horner: all chains advance the same
          step together — gather → batched INTT → strided gadget decomp →
          batched NTT → per-query MAC = 8 launches per step, independent of B
          — then download
 ```
 
-Every batched kernel preserves the single-query accumulation order, so
-`gpu_answer_batch` is bit-identical to `count` independent `gpu_answer`
-calls (`test_gpu_batch` enforces this).
+The Tensor Core path decomposes centered database and query values into byte
+planes, accumulates exactly within a proven INT32 row bound, and recombines
+the two RNS outputs. Custom geometries beyond that bound fail closed at the
+primitive wrapper and use the exact scalar fallback in protocol dispatch.
+`test_gpu_batch` verifies that batched answers match independent singles.
 
-Per-phase timing at the default geometry (db_rows=32768), measured with
-`GPU_ANSWER_TRACE=1` / `GPU_ANSWER_FINE=1`. All three phases scale with `n_packed`
-(= D_actual = horner chain length):
-
-| Phase | 1 GB (n_packed=8) | 16 GB (n_packed=128) | Notes |
-|---|---|---|---|
-| mat-vec | ~1.5 ms | ~14.5 ms | reads whole DB; bandwidth-bound; one-thread-per-column when columns fill the SMs |
-| upload ksk5/neg1 | ~0.2 ms | ~0.2 ms | tiny |
-| collapse (all groups) | ~0.65 ms | ~9 ms | lazy-collapse partial+reduce (grid over coeffs × step-chunks); fills the GPU |
-| upload RGSW | ~0.05 ms | ~0.05 ms | tiny |
-| horner + download | ~1.5 ms | ~10.5 ms | per-iter NTTs batched per modulus @ 1024 threads; `+packed` folded into the MAC |
-| TOTAL | **~2.9 ms** | **~34 ms** | |
-
-All three online phases are optimized (collapse step-parallelism, horner NTT
-batching + 1024-thread NTTs + fused add, mat-vec dispatch). Online Horner is
-GPU-compute bound, not launch-bound (launch/latency overhead ≈ 1%).
-Remaining headroom: mat-vec is ~55–67% of HBM bandwidth (vectorized u16 loads
-could approach the ~2.4 ms/1 GB floor); horner is a serial dependent chain whose
-floor is set by `D_actual` length.
+`GPU_ANSWER_TRACE=1` / `GPU_ANSWER_FINE=1` provide opt-in phase and kernel
+timing. Normal request wrappers do not synchronize merely for tracing. Query
+staging uses pinned host buffers and asynchronous copies; CUDA events join the
+per-group collapse streams to the default-stream Horner work without blocking
+the host.
 
 ### Streams
 
@@ -385,27 +370,13 @@ were removed). The remaining CPU code is:
 
 ## 9. Optimization pointer
 
-Remaining opportunities, in priority order (all sized against the batched
-profile at 16 GB, B=16: per-query ≈ 8.7 ms = mat-vec 5.8 + collapse 1.1 +
-horner 0.7 + transfers/host ~1.1):
+Remaining opportunities, in priority order:
 
-1. **Tensor-core INT8 mat-vec** — the batched mat-vec is INT32 compute-bound
-   (that is why its tile stops at 4). Decomposing operands into INT8 planes
-   and recombining with shifts (the VIPIR recipe, adapted to our two 27-bit
-   primes with K-tiled lazy accumulation) moves it back to bandwidth-bound:
-   one 16 GB stream per batch ≈ 9.6 ms, i.e. ~1 ms/query at B=16. Expected
-   endpoint ≈ 4 ms/query (~250 q/s/card). A `__dp4a` variant is the lower-risk
-   first step. This also removes the tall-geometry fallback (a GEMM handles
-   any shape), letting 1 GB amortize its DB stream too.
-2. **Batched b-poly prep in Stage 2** — the per-(group, query) copy+NTT prep
-   is 4·n_packed·B launches (8k at 16 GB / B=16); the lockstep-Horner
-   machinery (gather kernel + pointer-array NTT) collapses it to ~3. Matters
-   from B≈32 up, where submission overhead stops hiding.
-3. **Upload/compute pipelining** — overlap the ~22 MB/batch of H2D (b vectors,
+1. **Upload/compute pipelining** — overlap the ~22 MB/batch of H2D (b vectors,
    KSKs, RGSWs) and host-side marshalling with Stage 1; ~0.5–1 ms/query.
-4. **`GpuRingEmbedHelper` init on GPU** — ~400 ms off preprocess (mono32 table
+2. **`GpuRingEmbedHelper` init on GPU** — ~400 ms off preprocess (mono32 table
    generation still on CPU).
-5. **3-limb RNS-native gadget** — algorithmic. Eliminates the per-step NTT chain in
+3. **3-limb RNS-native gadget** — algorithmic. Eliminates the per-step NTT chain in
    `collapse_fused_kernel`; ~25% steady-state precomp memory, ~2–3× collapse. Bigger
    change; requires retuning the ciphertext modulus.
 
@@ -418,12 +389,14 @@ see git history. The batched profile supersedes that analysis.)
 test_ring, test_crypto                     # CPU client-primitive unit tests
 test_gpu_ntt, test_gpu_decomp,
 test_gpu_extprod, test_gpu_horner          # bit-exact vs CPU primitive
+test_gpu_matvec_tensor                     # exact Tensor/scalar matvec comparisons
+test_gpu_matvec_overflow_fallback          # adversarial unsafe-row fallback boundary
 test_e2e_gpu                               # Full pipeline, slot-exact; Small + Medium + 1 GB DB
 test_gpu_batch                             # batch path bit-identical to B independent singles
 test_capi                                  # C ABI facade round trip
 ```
 
-(9 ctest tests. There is no standalone collapse test — collapse is covered
+(11 ctest tests. There is no standalone collapse test — collapse is covered
 transitively by `test_e2e_gpu`'s slot-exact check.)
 
 Run with:
@@ -456,7 +429,7 @@ any other GPU/host are informational only, not contracts.
 
 For a change to be declared a "win," it must:
 1. **Not regress** the per-query latency or preprocess time at 1 GB DB.
-2. Keep all 9 `ctest` tests passing.
+2. Keep all 11 `ctest` tests passing.
 3. Match or beat the cited "expected gain" within ±20%, on this hardware.
 
 If an optimization doesn't reproduce its expected gain on sm_120, mention it in
@@ -473,8 +446,6 @@ A change is also evaluated on:
 
 ## 12. Open issues
 
-- **Tensor-core mat-vec** is the top remaining online lever at scale — see §9
-  item 1; §9 items 2–3 are the cheap follow-ups.
 - **Docs drift:** this doc's Status/per-phase numbers are a snapshot — refresh
   them when the kernels or geometry change.
 - The InsPIRe^(2) variant spec is a reviewed draft kept OUT of this repo

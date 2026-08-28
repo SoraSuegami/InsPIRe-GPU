@@ -19,7 +19,14 @@ namespace gpu {
 // (DB is row-major, so consecutive output columns j coalesce at a fixed row i)
 // ============================================================
 
-// Dual-limb matvec: reads u16 DB once, computes both RNS limbs in one pass.
+// Dual-limb matvec: decodes the in-place centered-byte representation and
+// writes directly to interleaved packed-polynomial storage.
+__device__ __forceinline__ uint16_t decode_centered_u16(uint16_t packed) {
+    int lo = (int)(int8_t)(packed & 0xffu) + 128;
+    int hi = (int)(int8_t)(packed >> 8) + 128;
+    return (uint16_t)(lo | (hi << 8));
+}
+
 __global__
 void matvec_kernel_dual(uint32_t* result0, uint32_t* result1,
                         const uint16_t* db_rm,
@@ -31,13 +38,14 @@ void matvec_kernel_dual(uint32_t* result0, uint32_t* result1,
 
     uint64_t acc0 = 0, acc1 = 0;
     for (size_t i = 0; i < db_rows; i++) {
-        uint64_t db_val = db_rm[i * db_cols + j];
+        uint64_t db_val = decode_centered_u16(db_rm[i * db_cols + j]);
         acc0 += db_val * query_mod0[i];
         acc1 += db_val * query_mod1[i];
         if ((i & 0xFFF) == 0xFFF) { acc0 %= q0; acc1 %= q1; }
     }
-    result0[j] = (uint32_t)(acc0 % q0);
-    result1[j] = (uint32_t)(acc1 % q1);
+    size_t out = (j / N) * 2 * N + (j % N);
+    result0[out] = (uint32_t)(acc0 % q0);
+    result1[out + N] = (uint32_t)(acc1 % q1);
 }
 
 
@@ -58,7 +66,7 @@ void matvec_kernel_dual_par(uint32_t* partials0, uint32_t* partials1,
 
     uint64_t acc0 = 0, acc1 = 0;
     for (size_t i = row_start; i < row_end; i++) {
-        uint64_t db_val = db_rm[i * db_cols + j];
+        uint64_t db_val = decode_centered_u16(db_rm[i * db_cols + j]);
         acc0 += db_val * query_mod0[i];
         acc1 += db_val * query_mod1[i];
         if ((i & 0xFFF) == 0xFFF) { acc0 %= q0; acc1 %= q1; }
@@ -80,8 +88,9 @@ void matvec_reduce2_kernel(uint32_t* result0, uint32_t* result1,
         s0 += partials0[b * db_cols + j];
         s1 += partials1[b * db_cols + j];
     }
-    result0[j] = (uint32_t)(s0 % q0);
-    result1[j] = (uint32_t)(s1 % q1);
+    size_t out = (j / N) * 2 * N + (j % N);
+    result0[out] = (uint32_t)(s0 % q0);
+    result1[out + N] = (uint32_t)(s1 % q1);
 }
 
 
@@ -121,7 +130,7 @@ void matvec_kernel_dual_batched(uint32_t* const* results0, uint32_t* const* resu
     for (int b = 0; b < BT; b++) { acc0[b] = 0; acc1[b] = 0; }
 
     for (size_t i = 0; i < db_rows; i++) {
-        uint64_t db_val = db_rm[i * db_cols + j];
+        uint64_t db_val = decode_centered_u16(db_rm[i * db_cols + j]);
         #pragma unroll
         for (int b = 0; b < BT; b++) {
             acc0[b] += db_val * qp0[b][i];
@@ -135,18 +144,21 @@ void matvec_kernel_dual_batched(uint32_t* const* results0, uint32_t* const* resu
     #pragma unroll
     for (int b = 0; b < BT; b++) {
         if (b < batch) {
-            results0[b][j] = (uint32_t)(acc0[b] % q0);
-            results1[b][j] = (uint32_t)(acc1[b] % q1);
+            size_t out = (j / N) * 2 * N + (j % N);
+            results0[b][out] = (uint32_t)(acc0[b] % q0);
+            results1[b][out + N] = (uint32_t)(acc1[b] % q1);
         }
     }
 }
 
-void gpu_matvec_dual_batched(uint32_t* const* d_results0, uint32_t* const* d_results1,
-                             const uint16_t* d_db_rm,
+void gpu_matvec_centered_packed_batched(
+                             uint32_t* const* d_results0, uint32_t* const* d_results1,
+                             const int8_t* d_centered_db_bytes,
                              const uint32_t* const* d_queries0,
                              const uint32_t* const* d_queries1,
                              size_t db_rows, size_t db_cols,
                              uint32_t q0, uint32_t q1, int batch) {
+    const auto* d_db_rm = reinterpret_cast<const uint16_t*>(d_centered_db_bytes);
     size_t threads = 256;
     size_t blocks = (db_cols + threads - 1) / threads;
 
@@ -164,14 +176,6 @@ void gpu_matvec_dual_batched(uint32_t* const* d_results0, uint32_t* const* d_res
             matvec_kernel_dual_batched<2><<<blocks, threads>>>(
                 r0, r1, d_db_rm, s0, s1, db_rows, db_cols, q0, q1, chunk);
     }
-}
-
-// The batched kernel is only profitable when one-thread-per-column fills the
-// GPU on its own (same condition as gpu_matvec_dual's simple path). Tall
-// narrow geometries need the row-split kernel, which the batched path does
-// not implement; the caller falls back to per-query gpu_matvec_dual there.
-bool gpu_matvec_batched_profitable(size_t db_cols) {
-    return (db_cols + 255) / 256 >= 150;
 }
 
 // ============================================================
@@ -216,11 +220,13 @@ void ext_prod_acc_kernel(
 }
 
 
-void gpu_matvec_dual(uint32_t* d_result0, uint32_t* d_result1,
-                     const uint16_t* d_db_rm,
-                     const uint32_t* d_query_mod0, const uint32_t* d_query_mod1,
-                     size_t db_rows, size_t db_cols,
-                     uint32_t q0, uint32_t q1) {
+void gpu_matvec_centered_packed(uint32_t* d_result0, uint32_t* d_result1,
+                               const int8_t* d_centered_db_bytes,
+                               const uint32_t* d_query_mod0, const uint32_t* d_query_mod1,
+                               size_t db_rows, size_t db_cols,
+                               uint32_t q0, uint32_t q1,
+                               uint32_t* d_partials0, uint32_t* d_partials1) {
+    const auto* d_db_rm = reinterpret_cast<const uint16_t*>(d_centered_db_bytes);
     size_t threads = 256;
 
     // Use the simple one-thread-per-column kernel whenever there are enough
@@ -244,20 +250,17 @@ void gpu_matvec_dual(uint32_t* d_result0, uint32_t* d_result1,
         if (rows_per_block < 64) rows_per_block = 64;
         size_t n_row_blocks = (db_rows + rows_per_block - 1) / rows_per_block;
 
-        uint32_t *d_p0, *d_p1;
-        CUDA_CHECK(cudaMalloc(&d_p0, n_row_blocks * db_cols * sizeof(uint32_t)));
-        CUDA_CHECK(cudaMalloc(&d_p1, n_row_blocks * db_cols * sizeof(uint32_t)));
+        assert(d_partials0 && d_partials1);
 
         size_t col_blocks = (db_cols + threads - 1) / threads;
         dim3 grid(col_blocks, n_row_blocks);
-        matvec_kernel_dual_par<<<grid, threads>>>(d_p0, d_p1, d_db_rm,
+        matvec_kernel_dual_par<<<grid, threads>>>(d_partials0, d_partials1, d_db_rm,
                                                    d_query_mod0, d_query_mod1,
                                                    db_rows, db_cols, q0, q1,
                                                    rows_per_block);
         matvec_reduce2_kernel<<<col_blocks, threads>>>(d_result0, d_result1,
-                                                        d_p0, d_p1, db_cols,
+                                                        d_partials0, d_partials1, db_cols,
                                                         n_row_blocks, q0, q1);
-        cudaFree(d_p0); cudaFree(d_p1);
     }
     CUDA_CHECK(cudaGetLastError());
 }
@@ -308,10 +311,10 @@ void gpu_ext_prod(
     uint32_t* b1_coeff = d_scratch_coeff + 3*n;
 
     // Step 1: INTT each limb of ct_a, ct_b → coeff form (batched per modulus).
-    CUDA_CHECK(cudaMemcpy(a0_coeff, d_ct_a,         n * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
-    CUDA_CHECK(cudaMemcpy(b0_coeff, d_ct_b,         n * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
-    CUDA_CHECK(cudaMemcpy(a1_coeff, d_ct_a + n,     n * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
-    CUDA_CHECK(cudaMemcpy(b1_coeff, d_ct_b + n,     n * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
+    CUDA_CHECK(cudaMemcpyAsync(a0_coeff, d_ct_a,     n * sizeof(uint32_t), cudaMemcpyDeviceToDevice, 0));
+    CUDA_CHECK(cudaMemcpyAsync(b0_coeff, d_ct_b,     n * sizeof(uint32_t), cudaMemcpyDeviceToDevice, 0));
+    CUDA_CHECK(cudaMemcpyAsync(a1_coeff, d_ct_a + n, n * sizeof(uint32_t), cudaMemcpyDeviceToDevice, 0));
+    CUDA_CHECK(cudaMemcpyAsync(b1_coeff, d_ct_b + n, n * sizeof(uint32_t), cudaMemcpyDeviceToDevice, 0));
     // Batched INTT via the primitives wrapper (1024 threads): [a0,b0] / [a1,b1].
     gpu_ntt_inverse_batch(a0_coeff, n, 2, Q0, d_inv_twiddles_q0, inv_n_q0, 1024);
     gpu_ntt_inverse_batch(a1_coeff, n, 2, Q1, d_inv_twiddles_q1, inv_n_q1, 1024);
@@ -491,8 +494,10 @@ void gpu_horner_eval(
     auto new_ev = [&]() { cudaEvent_t e; cudaEventCreate(&e); return e; };
 
     // Initialize: acc = packed[D-1]
-    CUDA_CHECK(cudaMemcpy(d_acc_a, d_packed_a + (D-1) * 2 * n, 2 * n * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
-    CUDA_CHECK(cudaMemcpy(d_acc_b, d_packed_b + (D-1) * 2 * n, 2 * n * sizeof(uint32_t), cudaMemcpyDeviceToDevice));
+    CUDA_CHECK(cudaMemcpyAsync(d_acc_a, d_packed_a + (D-1) * 2 * n,
+                               2 * n * sizeof(uint32_t), cudaMemcpyDeviceToDevice, 0));
+    CUDA_CHECK(cudaMemcpyAsync(d_acc_b, d_packed_b + (D-1) * 2 * n,
+                               2 * n * sizeof(uint32_t), cudaMemcpyDeviceToDevice, 0));
 
     for (int i = D - 2; i >= 0; i--) {
         if (fine) { ev0.push_back(new_ev()); cudaEventRecord(ev0.back(), 0); }
