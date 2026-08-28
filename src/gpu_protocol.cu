@@ -1114,10 +1114,10 @@ static void upload_ksks(GpuServerCtx* ctx, QuerySlot& slot, const QueryMessage& 
         }
         CUDA_CHECK(cudaMemcpy(slot.d_ksk5_b, h_buf.data(),
                               2 * D_EFF * N * sizeof(uint32_t), cudaMemcpyHostToDevice));
-        inspire::gpu::gpu_ntt_batch(slot.d_ksk5_b, N, D_EFF,
-                                    Q0, ctx->d_fwd_q0, 1024);
-        inspire::gpu::gpu_ntt_batch(slot.d_ksk5_b + D_EFF * N, N, D_EFF,
-                                    Q1, ctx->d_fwd_q1, 1024);
+        for (int j = 0; j < D_EFF; j++) {
+            inspire::gpu::gpu_ntt_forward(slot.d_ksk5_b + j * N, N, Q0, ctx->d_fwd_q0);
+            inspire::gpu::gpu_ntt_forward(slot.d_ksk5_b + D_EFF * N + j * N, N, Q1, ctx->d_fwd_q1);
+        }
     }
     {
         std::vector<uint32_t> h_buf(2 * D_EFF * N);
@@ -1131,10 +1131,10 @@ static void upload_ksks(GpuServerCtx* ctx, QuerySlot& slot, const QueryMessage& 
         }
         CUDA_CHECK(cudaMemcpy(slot.d_kskneg1_b, h_buf.data(),
                               2 * D_EFF * N * sizeof(uint32_t), cudaMemcpyHostToDevice));
-        inspire::gpu::gpu_ntt_batch(slot.d_kskneg1_b, N, D_EFF,
-                                    Q0, ctx->d_fwd_q0, 1024);
-        inspire::gpu::gpu_ntt_batch(slot.d_kskneg1_b + D_EFF * N, N, D_EFF,
-                                    Q1, ctx->d_fwd_q1, 1024);
+        for (int j = 0; j < D_EFF; j++) {
+            inspire::gpu::gpu_ntt_forward(slot.d_kskneg1_b + j * N, N, Q0, ctx->d_fwd_q0);
+            inspire::gpu::gpu_ntt_forward(slot.d_kskneg1_b + D_EFF * N + j * N, N, Q1, ctx->d_fwd_q1);
+        }
     }
 }
 
