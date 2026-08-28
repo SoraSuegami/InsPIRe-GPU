@@ -427,7 +427,7 @@ any other GPU/host are informational only, not contracts.
 
 For a change to be declared a "win," it must:
 1. **Not regress** the per-query latency or preprocess time at 1 GB DB.
-2. Keep all 9 `ctest` tests passing.
+2. Keep all 11 `ctest` tests passing.
 3. Match or beat the cited "expected gain" within ±20%, on this hardware.
 
 If an optimization doesn't reproduce its expected gain on sm_120, mention it in
