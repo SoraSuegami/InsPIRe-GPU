@@ -49,9 +49,9 @@ namespace inspire {
 //   d_perm_fwd, d_perm_conj: each (n/2-1) × N uint32
 
 // Upload d_eff polynomials in the layout [limb0: d_eff × N][limb1: d_eff × N].
-static void upload_rgsw_part(uint32_t* d_dst, const std::vector<RnsPoly>& parts) {
+static void upload_rgsw_part(uint32_t* d_dst, const std::vector<RnsPoly>& parts,
+                             uint32_t* h_buf) {
     assert((int)parts.size() == D_EFF);
-    std::vector<uint32_t> h_buf(2 * D_EFF * N);
     for (int j = 0; j < D_EFF; j++) {
         RnsPoly p = parts[j];
         if (!p.is_ntt) p.to_ntt();
@@ -60,9 +60,9 @@ static void upload_rgsw_part(uint32_t* d_dst, const std::vector<RnsPoly>& parts)
             h_buf[D_EFF * N + j * N + i]          = (uint32_t)p.limbs[1][i];
         }
     }
-    CUDA_CHECK(cudaMemcpy(d_dst, h_buf.data(),
-                          2 * D_EFF * N * sizeof(uint32_t),
-                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpyAsync(d_dst, h_buf,
+                               2 * D_EFF * N * sizeof(uint32_t),
+                               cudaMemcpyHostToDevice, 0));
 }
 
 // ============================================================
@@ -76,16 +76,22 @@ static void upload_rgsw_part(uint32_t* d_dst, const std::vector<RnsPoly>& parts)
 struct QuerySlot {
     uint32_t* d_query_b_q0;       // db_rows uint32
     uint32_t* d_query_b_q1;       // db_rows uint32
-    uint32_t* d_interm_q0;        // db_cols uint32 (mat-vec output, coeff)
-    uint32_t* d_interm_q1;
     uint32_t* d_ksk5_b;           // 2*d_eff*N
     uint32_t* d_kskneg1_b;        // 2*d_eff*N (in coeff form, NTT applied during use)
     uint32_t* d_rgsw_top_a;       // 2*d_eff*N
     uint32_t* d_rgsw_top_b;
     uint32_t* d_rgsw_bot_a;
     uint32_t* d_rgsw_bot_b;
-    uint32_t* d_packed_a;         // n_packed × 2*N
     uint32_t* d_packed_b;         // n_packed × 2*N
+    // Persistent pinned staging makes request H2D copies genuinely async.
+    uint32_t* h_query_b_q0;
+    uint32_t* h_query_b_q1;
+    uint32_t* h_ksk5_b;
+    uint32_t* h_kskneg1_b;
+    uint32_t* h_rgsw_top_a;
+    uint32_t* h_rgsw_top_b;
+    uint32_t* h_rgsw_bot_a;
+    uint32_t* h_rgsw_bot_b;
     // Horner scratch
     uint32_t* d_acc_a;
     uint32_t* d_acc_b;
@@ -128,6 +134,7 @@ struct GpuServerCtx {
     std::vector<uint32_t*> d_precomp_D_plus;   // [n_packed], each (n/2-1)*d_eff*2*N
     std::vector<uint32_t*> d_precomp_D_minus;  // same shape
     std::vector<uint32_t*> d_precomp_D_final;  // [n_packed], each d_eff*2*N
+    uint32_t* d_packed_a = nullptr;            // shared contiguous [n_packed][2*N]
 
     // Per-query scratch slots (cfg.max_batch of them, allocated at setup)
     std::vector<QuerySlot> slots;
@@ -911,21 +918,29 @@ GpuServerCtx* gpu_setup_server(const PublicParams& pp, const PreprocessData& pre
     const_cast<PreprocessData&>(precomp).d_precomp_D_minus.clear();
     const_cast<PreprocessData&>(precomp).d_precomp_D_final.clear();
 
+    // The a-side of every packed ciphertext is query-independent. Keep one
+    // contiguous copy shared by every slot, instead of copying/replicating it
+    // for every request in the batch.
+    CUDA_CHECK(cudaMalloc(&ctx->d_packed_a,
+                          pp.n_packed * 2 * N * sizeof(uint32_t)));
+    for (size_t g = 0; g < pp.n_packed; g++)
+        CUDA_CHECK(cudaMemcpyAsync(ctx->d_packed_a + g * 2 * N,
+                                   ctx->d_precomp_a[g],
+                                   2 * N * sizeof(uint32_t),
+                                   cudaMemcpyDeviceToDevice, 0));
+
     // Per-query scratch: cfg.max_batch slots, all allocated here so the
     // request path never allocates.
     ctx->slots.resize(cfg.max_batch);
     for (auto& sl : ctx->slots) {
         CUDA_CHECK(cudaMalloc(&sl.d_query_b_q0, pp.db_rows * sizeof(uint32_t)));
         CUDA_CHECK(cudaMalloc(&sl.d_query_b_q1, pp.db_rows * sizeof(uint32_t)));
-        CUDA_CHECK(cudaMalloc(&sl.d_interm_q0,  pp.db_cols * sizeof(uint32_t)));
-        CUDA_CHECK(cudaMalloc(&sl.d_interm_q1,  pp.db_cols * sizeof(uint32_t)));
         CUDA_CHECK(cudaMalloc(&sl.d_ksk5_b,     2 * D_EFF * N * sizeof(uint32_t)));
         CUDA_CHECK(cudaMalloc(&sl.d_kskneg1_b,  2 * D_EFF * N * sizeof(uint32_t)));
         CUDA_CHECK(cudaMalloc(&sl.d_rgsw_top_a, 2 * D_EFF * N * sizeof(uint32_t)));
         CUDA_CHECK(cudaMalloc(&sl.d_rgsw_top_b, 2 * D_EFF * N * sizeof(uint32_t)));
         CUDA_CHECK(cudaMalloc(&sl.d_rgsw_bot_a, 2 * D_EFF * N * sizeof(uint32_t)));
         CUDA_CHECK(cudaMalloc(&sl.d_rgsw_bot_b, 2 * D_EFF * N * sizeof(uint32_t)));
-        CUDA_CHECK(cudaMalloc(&sl.d_packed_a,   pp.n_packed * 2 * N * sizeof(uint32_t)));
         CUDA_CHECK(cudaMalloc(&sl.d_packed_b,   pp.n_packed * 2 * N * sizeof(uint32_t)));
         CUDA_CHECK(cudaMalloc(&sl.d_acc_a,      2 * N * sizeof(uint32_t)));
         CUDA_CHECK(cudaMalloc(&sl.d_acc_b,      2 * N * sizeof(uint32_t)));
@@ -933,6 +948,14 @@ GpuServerCtx* gpu_setup_server(const PublicParams& pp, const PreprocessData& pre
         CUDA_CHECK(cudaMalloc(&sl.d_res_b,      2 * N * sizeof(uint32_t)));
         CUDA_CHECK(cudaMalloc(&sl.d_scratch_coeff, 4 * N * sizeof(uint32_t)));
         CUDA_CHECK(cudaMalloc(&sl.d_dig,        4 * D_EFF * N * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMallocHost(&sl.h_query_b_q0, pp.db_rows * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMallocHost(&sl.h_query_b_q1, pp.db_rows * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMallocHost(&sl.h_ksk5_b,    2 * D_EFF * N * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMallocHost(&sl.h_kskneg1_b, 2 * D_EFF * N * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMallocHost(&sl.h_rgsw_top_a, 2 * D_EFF * N * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMallocHost(&sl.h_rgsw_top_b, 2 * D_EFF * N * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMallocHost(&sl.h_rgsw_bot_a, 2 * D_EFF * N * sizeof(uint32_t)));
+        CUDA_CHECK(cudaMallocHost(&sl.h_rgsw_bot_b, 2 * D_EFF * N * sizeof(uint32_t)));
     }
 
     // Device pointer arrays over the slot pool for the batched matvec.
@@ -942,8 +965,8 @@ GpuServerCtx* gpu_setup_server(const PublicParams& pp, const PreprocessData& pre
         for (size_t i = 0; i < cfg.max_batch; i++) {
             q0[i] = ctx->slots[i].d_query_b_q0;
             q1[i] = ctx->slots[i].d_query_b_q1;
-            r0[i] = ctx->slots[i].d_interm_q0;
-            r1[i] = ctx->slots[i].d_interm_q1;
+            r0[i] = ctx->slots[i].d_packed_b;
+            r1[i] = ctx->slots[i].d_packed_b;
         }
         const size_t pb = cfg.max_batch * sizeof(uint32_t*);
         CUDA_CHECK(cudaMalloc(&ctx->d_mv_q0_ptrs, pb));
@@ -971,14 +994,15 @@ GpuServerCtx* gpu_setup_server(const PublicParams& pp, const PreprocessData& pre
         const size_t per_group = (2 * N)                              // a
                                + 2 * (2 * n_steps_bk * D_EFF * N)     // D_plus + D_minus
                                + (2 * D_EFF * N);                     // D_final
-        const size_t per_slot = 2 * pp.db_rows + 2 * pp.db_cols
+        const size_t per_slot = 2 * pp.db_rows
                               + 6 * (2 * D_EFF * N)
-                              + 2 * (pp.n_packed * 2 * N)
+                              + (pp.n_packed * 2 * N)
                               + 4 * (2 * N) + 4 * N + 4 * D_EFF * N;
         ctx->resident_bytes =
               (size_t)pp.db_rows * pp.db_cols * sizeof(uint16_t)      // encoded DB
             + pp.n_packed * per_group * sizeof(uint32_t)              // precomp
-            + cfg.max_batch * per_slot * sizeof(uint32_t)             // slot pools
+            + cfg.max_batch * per_slot * sizeof(uint32_t)             // device slot pools
+            + pp.n_packed * 2 * N * sizeof(uint32_t)                  // shared packed a
             + 2 * (n_steps_bk * N) * sizeof(uint32_t)                 // perm tables
             + 4 * N * sizeof(uint32_t)                                // twiddles
             + 2 * pp.db_cols * sizeof(int32_t)                        // centered DB sums
@@ -1048,7 +1072,7 @@ GpuServerCtx* gpu_setup_server(const PublicParams& pp, const PreprocessData& pre
         for (size_t i = 0; i < mb; i++) {
             aa[i] = ctx->slots[i].d_acc_a;
             ab[i] = ctx->slots[i].d_acc_b;
-            pa[i] = ctx->slots[i].d_packed_a;
+            pa[i] = ctx->d_packed_a;
             ta[i] = ctx->slots[i].d_rgsw_top_a;
             tb[i] = ctx->slots[i].d_rgsw_top_b;
             ba[i] = ctx->slots[i].d_rgsw_bot_a;
@@ -1088,22 +1112,23 @@ GpuServerCtx* gpu_setup_server(const PublicParams& pp, const PreprocessData& pre
 // Host-side mod reduction + H2D of the query's b vector into a slot.
 static void upload_query_b(GpuServerCtx* ctx, QuerySlot& slot, const QueryMessage& qry) {
     const PublicParams& pp = ctx->pp;
-    std::vector<uint32_t> q0_buf(pp.db_rows), q1_buf(pp.db_rows);
     for (size_t i = 0; i < pp.db_rows; i++) {
-        q0_buf[i] = (uint32_t)(qry.lwe.b_limb0[i] % Q0);
-        q1_buf[i] = (uint32_t)(qry.lwe.b_limb1[i] % Q1);
+        slot.h_query_b_q0[i] = (uint32_t)(qry.lwe.b_limb0[i] % Q0);
+        slot.h_query_b_q1[i] = (uint32_t)(qry.lwe.b_limb1[i] % Q1);
     }
-    CUDA_CHECK(cudaMemcpy(slot.d_query_b_q0, q0_buf.data(),
-                          pp.db_rows * sizeof(uint32_t), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(slot.d_query_b_q1, q1_buf.data(),
-                          pp.db_rows * sizeof(uint32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpyAsync(slot.d_query_b_q0, slot.h_query_b_q0,
+                               pp.db_rows * sizeof(uint32_t),
+                               cudaMemcpyHostToDevice, 0));
+    CUDA_CHECK(cudaMemcpyAsync(slot.d_query_b_q1, slot.h_query_b_q1,
+                               pp.db_rows * sizeof(uint32_t),
+                               cudaMemcpyHostToDevice, 0));
 }
 
 // Upload the query's two key-switching-key b-parts into the slot and NTT
 // them (the client sends them in coefficient form).
 static void upload_ksks(GpuServerCtx* ctx, QuerySlot& slot, const QueryMessage& qry) {
     {
-        std::vector<uint32_t> h_buf(2 * D_EFF * N);
+        uint32_t* h_buf = slot.h_ksk5_b;
         for (int j = 0; j < D_EFF; j++) {
             RnsPoly p = qry.ksk_5.b_parts[j];
             if (p.is_ntt) p.to_coeff();
@@ -1112,15 +1137,16 @@ static void upload_ksks(GpuServerCtx* ctx, QuerySlot& slot, const QueryMessage& 
                 h_buf[D_EFF * N + j * N + i] = (uint32_t)p.limbs[1][i];
             }
         }
-        CUDA_CHECK(cudaMemcpy(slot.d_ksk5_b, h_buf.data(),
-                              2 * D_EFF * N * sizeof(uint32_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpyAsync(slot.d_ksk5_b, h_buf,
+                                   2 * D_EFF * N * sizeof(uint32_t),
+                                   cudaMemcpyHostToDevice, 0));
         inspire::gpu::gpu_ntt_batch(slot.d_ksk5_b, N, D_EFF,
                                     Q0, ctx->d_fwd_q0, 1024);
         inspire::gpu::gpu_ntt_batch(slot.d_ksk5_b + D_EFF * N, N, D_EFF,
                                     Q1, ctx->d_fwd_q1, 1024);
     }
     {
-        std::vector<uint32_t> h_buf(2 * D_EFF * N);
+        uint32_t* h_buf = slot.h_kskneg1_b;
         for (int j = 0; j < D_EFF; j++) {
             RnsPoly p = qry.ksk_neg1.b_parts[j];
             if (p.is_ntt) p.to_coeff();
@@ -1129,8 +1155,9 @@ static void upload_ksks(GpuServerCtx* ctx, QuerySlot& slot, const QueryMessage& 
                 h_buf[D_EFF * N + j * N + i] = (uint32_t)p.limbs[1][i];
             }
         }
-        CUDA_CHECK(cudaMemcpy(slot.d_kskneg1_b, h_buf.data(),
-                              2 * D_EFF * N * sizeof(uint32_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpyAsync(slot.d_kskneg1_b, h_buf,
+                                   2 * D_EFF * N * sizeof(uint32_t),
+                                   cudaMemcpyHostToDevice, 0));
         inspire::gpu::gpu_ntt_batch(slot.d_kskneg1_b, N, D_EFF,
                                     Q0, ctx->d_fwd_q0, 1024);
         inspire::gpu::gpu_ntt_batch(slot.d_kskneg1_b + D_EFF * N, N, D_EFF,
@@ -1160,7 +1187,7 @@ static RlweCt download_ct(QuerySlot& slot) {
 }
 
 // skip_matvec: the caller (gpu_answer_batch) has already uploaded the b
-// vector and run the batched matvec into slot.d_interm_*.
+// vector and run the batched matvec directly into slot.d_packed_b.
 // skip_pack: the caller has already uploaded the keys and run the batched
 // pack into slot.d_packed_*; start from Horner.
 static std::vector<RlweCt> answer_one(GpuServerCtx* ctx, QuerySlot& slot,
@@ -1233,14 +1260,14 @@ static std::vector<RlweCt> answer_one(GpuServerCtx* ctx, QuerySlot& slot,
             ctx->d_db_rm, ctx->d_db_byte_sums,
             ctx->d_mv_q0_ptrs, ctx->d_mv_q1_ptrs,
             ctx->d_mv_query_planes, ctx->d_mv_query_sums, ctx->d_mv_gemm_out,
-            pp.db_rows, pp.db_cols, Q0, Q1, 1, ctx->cublas);
+            pp.db_rows, pp.db_cols, Q0, Q1, 1, true, ctx->cublas);
         mark("mat-vec");
     }
 
     // ===== Step 2: Pack each group =====
     // For each group g:
-    //   - b values are at d_interm_qX[g*N : (g+1)*N], in coefficient form
-    //   - NTT them (per limb)
+    //   - b values are already in d_packed_b[g] in coefficient form
+    //   - NTT them in place (per limb)
     //   - Run InspiRINGOnline (lazy collapse) to produce packed[g] (NTT form)
     //
     // First, upload ksk5 and ksk_neg1 b-parts, then GPU NTT. The client sends
@@ -1252,16 +1279,16 @@ static std::vector<RlweCt> answer_one(GpuServerCtx* ctx, QuerySlot& slot,
 
         // Independent of mat-vec/collapse: stage RGSW before the per-group
         // streams start so its H2D copies never wait behind collapse.
-        upload_rgsw_part(slot.d_rgsw_top_a, qry.rgsw.top.a_parts);
-        upload_rgsw_part(slot.d_rgsw_top_b, qry.rgsw.top.b_parts);
-        upload_rgsw_part(slot.d_rgsw_bot_a, qry.rgsw.bottom.a_parts);
-        upload_rgsw_part(slot.d_rgsw_bot_b, qry.rgsw.bottom.b_parts);
+        upload_rgsw_part(slot.d_rgsw_top_a, qry.rgsw.top.a_parts, slot.h_rgsw_top_a);
+        upload_rgsw_part(slot.d_rgsw_top_b, qry.rgsw.top.b_parts, slot.h_rgsw_top_b);
+        upload_rgsw_part(slot.d_rgsw_bot_a, qry.rgsw.bottom.a_parts, slot.h_rgsw_bot_a);
+        upload_rgsw_part(slot.d_rgsw_bot_b, qry.rgsw.bottom.b_parts, slot.h_rgsw_bot_b);
         mark("upload RGSW");
     }
 
     // For each group g, run the lazy collapse pipeline:
-    //   1. b_q0 = NTT(d_interm_q0[g*N : (g+1)*N])
-    //   2. b_q1 = NTT(d_interm_q1[g*N : (g+1)*N])
+    //   1. b_q0 = NTT(d_packed_b[g].q0)
+    //   2. b_q1 = NTT(d_packed_b[g].q1)
     //   3. Forward CollapseHalf (uses D_plus, ksk5, perm_fwd) — modifies b
     //   4. Conjugate CollapseHalf (uses D_minus, ksk5, perm_conj) — modifies b
     //   5. Final CollapseOne (uses D_final, ksk_neg1) — modifies b
@@ -1286,10 +1313,6 @@ static std::vector<RlweCt> answer_one(GpuServerCtx* ctx, QuerySlot& slot,
                 + (g % n_streams) * inspire::gpu::LAZY_COLLAPSE_STEP_CHUNKS * N;
 
             int fp = fine_begin("prep memcpy+NTT", s);
-            cudaMemcpyAsync(d_b_q0, slot.d_interm_q0 + g * N, N * sizeof(uint32_t),
-                            cudaMemcpyDeviceToDevice, s);
-            cudaMemcpyAsync(d_b_q1, slot.d_interm_q1 + g * N, N * sizeof(uint32_t),
-                            cudaMemcpyDeviceToDevice, s);
             inspire::gpu::gpu_ntt_forward_stream(d_b_q0, N, Q0, ctx->d_fwd_q0, s);
             inspire::gpu::gpu_ntt_forward_stream(d_b_q1, N, Q1, ctx->d_fwd_q1, s);
             fine_end(fp, s);
@@ -1330,10 +1353,6 @@ static std::vector<RlweCt> answer_one(GpuServerCtx* ctx, QuerySlot& slot,
                 slot.d_kskneg1_b + per_limb_kf,
                 D_EFF, N, Q1, s);
 
-            cudaMemcpyAsync(slot.d_packed_a + g * 2 * N,
-                            ctx->d_precomp_a[g],
-                            2 * N * sizeof(uint32_t),
-                            cudaMemcpyDeviceToDevice, s);
             fine_end(fi, s);
         }
         // Join stream work on the default stream without blocking the host.
@@ -1358,7 +1377,7 @@ static std::vector<RlweCt> answer_one(GpuServerCtx* ctx, QuerySlot& slot,
         if (slice_len == 1) {
             // Trivial case: just copy packed[start] to result.
             // Copy the packed accumulator out (stays in NTT form).
-            uint32_t* d_pa = slot.d_packed_a + start * 2 * N;
+            uint32_t* d_pa = ctx->d_packed_a + start * 2 * N;
             uint32_t* d_pb = slot.d_packed_b + start * 2 * N;
             CUDA_CHECK(cudaMemcpyAsync(slot.d_acc_a, d_pa, 2 * N * sizeof(uint32_t),
                                        cudaMemcpyDeviceToDevice, 0));
@@ -1369,7 +1388,7 @@ static std::vector<RlweCt> answer_one(GpuServerCtx* ctx, QuerySlot& slot,
             int fh = fine_begin("horner_eval (ext_prod chain)", 0);
             inspire::gpu::gpu_horner_eval(
                 slot.d_acc_a, slot.d_acc_b,
-                slot.d_packed_a + start * 2 * N,
+                ctx->d_packed_a + start * 2 * N,
                 slot.d_packed_b + start * 2 * N,
                 (int)slice_len,
                 slot.d_rgsw_top_a, slot.d_rgsw_top_b,
@@ -1393,7 +1412,7 @@ static std::vector<RlweCt> answer_one(GpuServerCtx* ctx, QuerySlot& slot,
 
 // B3: pack all groups for `count` slots with the batched collapse kernels —
 // each group's precomp tensor is streamed once and applied to every query.
-// Preconditions: every slot's d_interm_* holds its matvec output and its
+// Preconditions: every slot's d_packed_b holds its matvec output and its
 // keys are uploaded (upload_ksks). Postcondition: slot.d_packed_{a,b} filled.
 static void batched_pack(GpuServerCtx* ctx, size_t count) {
     const PublicParams& pp = ctx->pp;
@@ -1415,10 +1434,6 @@ static void batched_pack(GpuServerCtx* ctx, size_t count) {
             QuerySlot& sl = ctx->slots[b];
             uint32_t* d_b_q0 = sl.d_packed_b + off_q0;
             uint32_t* d_b_q1 = sl.d_packed_b + off_q1;
-            cudaMemcpyAsync(d_b_q0, sl.d_interm_q0 + g * N, N * sizeof(uint32_t),
-                            cudaMemcpyDeviceToDevice, s);
-            cudaMemcpyAsync(d_b_q1, sl.d_interm_q1 + g * N, N * sizeof(uint32_t),
-                            cudaMemcpyDeviceToDevice, s);
             inspire::gpu::gpu_ntt_forward_stream(d_b_q0, N, Q0, ctx->d_fwd_q0, s);
             inspire::gpu::gpu_ntt_forward_stream(d_b_q1, N, Q1, ctx->d_fwd_q1, s);
         }
@@ -1451,11 +1466,6 @@ static void batched_pack(GpuServerCtx* ctx, size_t count) {
             pb_bases, off_q1, ctx->d_precomp_D_final[g] + per_limb_kf,
             ctx->d_slot_kskneg1_ptrs, per_limb_kf, D_EFF, N, Q1, (int)count, s);
 
-        // The packed a is query-independent precomp; copy into each slot.
-        for (size_t b = 0; b < count; b++) {
-            cudaMemcpyAsync(ctx->slots[b].d_packed_a + off_q0, ctx->d_precomp_a[g],
-                            2 * N * sizeof(uint32_t), cudaMemcpyDeviceToDevice, s);
-        }
     }
     for (size_t i = 0; i < ctx->streams.size(); i++) {
         CUDA_CHECK(cudaEventRecord(ctx->stream_done_events[i], ctx->streams[i]));
@@ -1521,7 +1531,7 @@ gpu_answer_batch(GpuServerCtx* ctx, const QueryMessage* queries, size_t count) {
         ctx->d_db_rm, ctx->d_db_byte_sums,
         ctx->d_mv_q0_ptrs, ctx->d_mv_q1_ptrs,
         ctx->d_mv_query_planes, ctx->d_mv_query_sums, ctx->d_mv_gemm_out,
-        ctx->pp.db_rows, ctx->pp.db_cols, Q0, Q1, (int)count, ctx->cublas);
+        ctx->pp.db_rows, ctx->pp.db_cols, Q0, Q1, (int)count, true, ctx->cublas);
     mark("mat-vec (incl. b upload)");
 
     // Stage 2: batched pack — every group's precomp tensor is streamed once
@@ -1529,10 +1539,14 @@ gpu_answer_batch(GpuServerCtx* ctx, const QueryMessage* queries, size_t count) {
     for (size_t i = 0; i < count; i++)
         upload_ksks(ctx, ctx->slots[i], queries[i]);
     for (size_t i = 0; i < count; i++) {
-        upload_rgsw_part(ctx->slots[i].d_rgsw_top_a, queries[i].rgsw.top.a_parts);
-        upload_rgsw_part(ctx->slots[i].d_rgsw_top_b, queries[i].rgsw.top.b_parts);
-        upload_rgsw_part(ctx->slots[i].d_rgsw_bot_a, queries[i].rgsw.bottom.a_parts);
-        upload_rgsw_part(ctx->slots[i].d_rgsw_bot_b, queries[i].rgsw.bottom.b_parts);
+        upload_rgsw_part(ctx->slots[i].d_rgsw_top_a, queries[i].rgsw.top.a_parts,
+                         ctx->slots[i].h_rgsw_top_a);
+        upload_rgsw_part(ctx->slots[i].d_rgsw_top_b, queries[i].rgsw.top.b_parts,
+                         ctx->slots[i].h_rgsw_top_b);
+        upload_rgsw_part(ctx->slots[i].d_rgsw_bot_a, queries[i].rgsw.bottom.a_parts,
+                         ctx->slots[i].h_rgsw_bot_a);
+        upload_rgsw_part(ctx->slots[i].d_rgsw_bot_b, queries[i].rgsw.bottom.b_parts,
+                         ctx->slots[i].h_rgsw_bot_b);
     }
     batched_pack(ctx, count);
     mark("pack/collapse (incl. ksk upload)");
@@ -1557,7 +1571,7 @@ gpu_answer_batch(GpuServerCtx* ctx, const QueryMessage* queries, size_t count) {
             // Init: acc[b] = packed[start + L - 1].
             for (size_t b = 0; b < count; b++) {
                 QuerySlot& sl = ctx->slots[b];
-                CUDA_CHECK(cudaMemcpyAsync(sl.d_acc_a, sl.d_packed_a + (start + L - 1) * 2 * N,
+                CUDA_CHECK(cudaMemcpyAsync(sl.d_acc_a, ctx->d_packed_a + (start + L - 1) * 2 * N,
                                            2 * N * sizeof(uint32_t), cudaMemcpyDeviceToDevice, 0));
                 CUDA_CHECK(cudaMemcpyAsync(sl.d_acc_b, sl.d_packed_b + (start + L - 1) * 2 * N,
                                            2 * N * sizeof(uint32_t), cudaMemcpyDeviceToDevice, 0));
@@ -1609,17 +1623,21 @@ void gpu_free_server(GpuServerCtx* ctx) {
     for (auto p : ctx->d_precomp_D_plus) cudaFree(p);
     for (auto p : ctx->d_precomp_D_minus) cudaFree(p);
     for (auto p : ctx->d_precomp_D_final) cudaFree(p);
+    cudaFree(ctx->d_packed_a);
     for (auto& sl : ctx->slots) {
         cudaFree(sl.d_query_b_q0); cudaFree(sl.d_query_b_q1);
-        cudaFree(sl.d_interm_q0); cudaFree(sl.d_interm_q1);
         cudaFree(sl.d_ksk5_b); cudaFree(sl.d_kskneg1_b);
         cudaFree(sl.d_rgsw_top_a); cudaFree(sl.d_rgsw_top_b);
         cudaFree(sl.d_rgsw_bot_a); cudaFree(sl.d_rgsw_bot_b);
-        cudaFree(sl.d_packed_a); cudaFree(sl.d_packed_b);
+        cudaFree(sl.d_packed_b);
         cudaFree(sl.d_acc_a); cudaFree(sl.d_acc_b);
         cudaFree(sl.d_res_a); cudaFree(sl.d_res_b);
         cudaFree(sl.d_scratch_coeff);
         cudaFree(sl.d_dig);
+        cudaFreeHost(sl.h_query_b_q0); cudaFreeHost(sl.h_query_b_q1);
+        cudaFreeHost(sl.h_ksk5_b); cudaFreeHost(sl.h_kskneg1_b);
+        cudaFreeHost(sl.h_rgsw_top_a); cudaFreeHost(sl.h_rgsw_top_b);
+        cudaFreeHost(sl.h_rgsw_bot_a); cudaFreeHost(sl.h_rgsw_bot_b);
     }
     cudaFree(ctx->d_lazy_partials);
     cudaFree((void*)ctx->d_mv_q0_ptrs); cudaFree((void*)ctx->d_mv_q1_ptrs);

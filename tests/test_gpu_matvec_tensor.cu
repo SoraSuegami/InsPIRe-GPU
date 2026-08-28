@@ -98,7 +98,7 @@ int main() {
     gpu_matvec_tensor_batched(
         d_r0_ptrs, d_r1_ptrs, d_db, d_db_sums,
         d_q0_ptrs, d_q1_ptrs, d_q_planes, d_q_sums, d_gemm,
-        rows, cols, Q0, Q1, batch, handle);
+        rows, cols, Q0, Q1, batch, false, handle);
     CUDA_OK(cudaDeviceSynchronize());
 
     std::vector<uint32_t> got0((size_t)batch * cols), got1((size_t)batch * cols);

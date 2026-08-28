@@ -107,7 +107,7 @@ __global__ void recompose_tensor_matvec_kernel(
         const int32_t* query_sums,
         size_t db_rows, size_t db_cols,
         uint32_t q0, uint32_t q1,
-        int batch) {
+        int batch, bool interleaved_rns_output) {
     size_t j = blockIdx.x * blockDim.x + threadIdx.x;
     int b = (int)blockIdx.y;
     if (j >= db_cols || b >= batch) return;
@@ -140,8 +140,16 @@ __global__ void recompose_tensor_matvec_kernel(
         }
         residues[limb] = acc;
     }
-    out0[b][j] = residues[0];
-    out1[b][j] = residues[1];
+    if (interleaved_rns_output) {
+        const size_t coeff = j % N;
+        const size_t group = j / N;
+        const size_t base = group * 2 * N;
+        out0[b][base + coeff] = residues[0];
+        out1[b][base + N + coeff] = residues[1];
+    } else {
+        out0[b][j] = residues[0];
+        out1[b][j] = residues[1];
+    }
 }
 
 void gpu_matvec_tensor_batched(
@@ -150,7 +158,7 @@ void gpu_matvec_tensor_batched(
     const uint32_t* const* d_queries0, const uint32_t* const* d_queries1,
     int8_t* d_query_planes, int32_t* d_query_sums, int32_t* d_gemm_out,
     size_t db_rows, size_t db_cols, uint32_t q0, uint32_t q1,
-    int batch, cublasHandle_t handle) {
+    int batch, bool interleaved_rns_output, cublasHandle_t handle) {
     const int plane_cols = batch * 8;
     const size_t threads = 256;
     dim3 qgrid((db_rows + threads - 1) / threads, plane_cols);
@@ -178,7 +186,7 @@ void gpu_matvec_tensor_batched(
     recompose_tensor_matvec_kernel<<<out_grid, threads>>>(
         d_results0, d_results1, d_gemm_out,
         d_db_byte_sums, d_query_sums,
-        db_rows, db_cols, q0, q1, batch);
+        db_rows, db_cols, q0, q1, batch, interleaved_rns_output);
     CUDA_CHECK(cudaGetLastError());
 }
 

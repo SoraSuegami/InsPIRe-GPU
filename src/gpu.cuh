@@ -233,7 +233,7 @@ void gpu_matvec_tensor_batched(
     const uint32_t* const* d_queries0, const uint32_t* const* d_queries1,
     int8_t* d_query_planes, int32_t* d_query_sums, int32_t* d_gemm_out,
     size_t db_rows, size_t db_cols, uint32_t q0, uint32_t q1,
-    int batch, cublasHandle_t handle);
+    int batch, bool interleaved_rns_output, cublasHandle_t handle);
 
 // Dual-limb mat-vec: reads u16 DB once, computes both RNS limbs in one pass.
 // Dispatches between a "wide" simple kernel (db_cols >> db_rows) and a tall
