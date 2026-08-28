@@ -21,7 +21,10 @@ namespace inspire {
 namespace gpu {
 
 __global__ void center_db_bytes_kernel(uint8_t* db_bytes, size_t count) {
-    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    // Cast before multiplying: the production 16 GB database requires more
+    // than 2^32 byte indices, while CUDA's built-in index components are
+    // 32-bit values.
+    size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i < count) {
         uint8_t u = db_bytes[i];
         reinterpret_cast<int8_t*>(db_bytes)[i] = (int8_t)((int)u - 128);

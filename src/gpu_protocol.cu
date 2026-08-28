@@ -1114,10 +1114,10 @@ static void upload_ksks(GpuServerCtx* ctx, QuerySlot& slot, const QueryMessage& 
         }
         CUDA_CHECK(cudaMemcpy(slot.d_ksk5_b, h_buf.data(),
                               2 * D_EFF * N * sizeof(uint32_t), cudaMemcpyHostToDevice));
-        for (int j = 0; j < D_EFF; j++) {
-            inspire::gpu::gpu_ntt_forward(slot.d_ksk5_b + j * N, N, Q0, ctx->d_fwd_q0);
-            inspire::gpu::gpu_ntt_forward(slot.d_ksk5_b + D_EFF * N + j * N, N, Q1, ctx->d_fwd_q1);
-        }
+        inspire::gpu::gpu_ntt_batch(slot.d_ksk5_b, N, D_EFF,
+                                    Q0, ctx->d_fwd_q0, 1024);
+        inspire::gpu::gpu_ntt_batch(slot.d_ksk5_b + D_EFF * N, N, D_EFF,
+                                    Q1, ctx->d_fwd_q1, 1024);
     }
     {
         std::vector<uint32_t> h_buf(2 * D_EFF * N);
@@ -1131,10 +1131,10 @@ static void upload_ksks(GpuServerCtx* ctx, QuerySlot& slot, const QueryMessage& 
         }
         CUDA_CHECK(cudaMemcpy(slot.d_kskneg1_b, h_buf.data(),
                               2 * D_EFF * N * sizeof(uint32_t), cudaMemcpyHostToDevice));
-        for (int j = 0; j < D_EFF; j++) {
-            inspire::gpu::gpu_ntt_forward(slot.d_kskneg1_b + j * N, N, Q0, ctx->d_fwd_q0);
-            inspire::gpu::gpu_ntt_forward(slot.d_kskneg1_b + D_EFF * N + j * N, N, Q1, ctx->d_fwd_q1);
-        }
+        inspire::gpu::gpu_ntt_batch(slot.d_kskneg1_b, N, D_EFF,
+                                    Q0, ctx->d_fwd_q0, 1024);
+        inspire::gpu::gpu_ntt_batch(slot.d_kskneg1_b + D_EFF * N, N, D_EFF,
+                                    Q1, ctx->d_fwd_q1, 1024);
     }
 }
 
@@ -1336,8 +1336,11 @@ static std::vector<RlweCt> answer_one(GpuServerCtx* ctx, QuerySlot& slot,
                             cudaMemcpyDeviceToDevice, s);
             fine_end(fi, s);
         }
-        // Ensure every packed polynomial is ready before Horner consumes it.
-        for (auto s : ctx->streams) CUDA_CHECK(cudaStreamSynchronize(s));
+        // Join stream work on the default stream without blocking the host.
+        for (size_t i = 0; i < ctx->streams.size(); i++) {
+            CUDA_CHECK(cudaEventRecord(ctx->stream_done_events[i], ctx->streams[i]));
+            CUDA_CHECK(cudaStreamWaitEvent(0, ctx->stream_done_events[i], 0));
+        }
         mark("collapse all groups");
     }
 
@@ -1454,7 +1457,10 @@ static void batched_pack(GpuServerCtx* ctx, size_t count) {
                             2 * N * sizeof(uint32_t), cudaMemcpyDeviceToDevice, s);
         }
     }
-    for (auto s : ctx->streams) CUDA_CHECK(cudaStreamSynchronize(s));
+    for (size_t i = 0; i < ctx->streams.size(); i++) {
+        CUDA_CHECK(cudaEventRecord(ctx->stream_done_events[i], ctx->streams[i]));
+        CUDA_CHECK(cudaStreamWaitEvent(0, ctx->stream_done_events[i], 0));
+    }
 }
 
 std::vector<RlweCt> gpu_answer(GpuServerCtx* ctx, const QueryMessage& qry) {
