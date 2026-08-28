@@ -56,9 +56,9 @@ latencies.
 
 | DB | per-query latency | comm (query↑ + resp↓) | hint (precomp + DB resident) | setup |
 |---|---|---|---|---|
-| **1 GB** (2²³ items) | **2.02 ms** | 383 KB (371 + 12) | 1.61 GB | 1.7 s |
-| **4 GB** (2²⁵ items) | **8.11 ms** | 383 KB | 6.44 GB | 2.1 s |
-| **16 GB** (2²⁷ items) | **32.01 ms** | 383 KB | 25.77 GB | 4.8 s |
+| **1 GB** (2²³ items) | **2.07 ms** | 383 KB (371 + 12) | 1.61 GB | 2.1 s |
+| **4 GB** (2²⁵ items) | **8.19 ms** | 383 KB | 6.44 GB | 2.4 s |
+| **16 GB** (2²⁷ items) | **32.12 ms** | 383 KB | 25.77 GB | 5.1 s |
 
 Both communication directions are real wire bytes now: queries are 53-bit
 CRT-packed (`ipir_query_pack`), responses are modulus-switched to q'
@@ -75,13 +75,14 @@ collapse, and a lockstep Horner whose launch count is independent of B.
 
 | 16 GB DB | batch latency | per-query | throughput |
 |---|---|---|---|
-| B=1 | 32.06 ms | 32.06 ms | 31.2 q/s |
-| B=4 | 36.64 ms | 9.16 ms | 109.2 q/s |
-| B=8 | 48.03 ms | 6.00 ms | 166.6 q/s |
-| B=16 | 73.36 ms | 4.59 ms | 218.1 q/s |
-| B=32 | 137.10 ms | 4.28 ms | 233.4 q/s |
+| B=1 | 31.92 ms | 31.92 ms | 31.3 q/s |
+| B=2 | 34.97 ms | 17.49 ms | 57.2 q/s |
+| B=4 | 36.77 ms | 9.19 ms | 108.8 q/s |
+| B=8 | 48.34 ms | 6.04 ms | 165.5 q/s |
+| B=16 | 73.37 ms | 4.59 ms | 218.1 q/s |
+| B=32 | 137.41 ms | 4.29 ms | 232.9 q/s |
 
-At B=32, throughput reaches **817.9 q/s** at 4 GB and **2,270.1 q/s** at
+At B=32, throughput reaches **818.8 q/s** at 4 GB and **2,268.2 q/s** at
 1 GB. Larger batches use one exact centered-INT8 GEMM for all queries and
 both RNS limbs; small batches retain the lower-overhead scalar path.
 
@@ -308,8 +309,9 @@ per-group loop:
 batched collapse: one kernel launch covering all groups (Phase 10)
 ```
 
-Preprocess total at the default geometry (db_rows=32768): 1.7 s @ 1 GB, 2.1 s
-@ 4 GB, and 4.8 s @ 16 GB. The row-major encode (upload one u16 copy + in-place
+Setup total (preprocess plus server context) at the default geometry
+(`db_rows=32768`): 2.1 s @ 1 GB, 2.4 s @ 4 GB, and 5.1 s @ 16 GB. The
+row-major encode (upload one u16 copy + in-place
 inverse-DFT, coalesced), followed by in-place byte centering during server setup,
 keeps one DB allocation and avoids a transpose.
 
