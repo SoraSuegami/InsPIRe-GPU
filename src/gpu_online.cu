@@ -19,7 +19,14 @@ namespace gpu {
 // (DB is row-major, so consecutive output columns j coalesce at a fixed row i)
 // ============================================================
 
-// Dual-limb matvec: reads u16 DB once, computes both RNS limbs in one pass.
+// Dual-limb matvec: decodes the in-place centered-byte representation and
+// writes directly to interleaved packed-polynomial storage.
+__device__ __forceinline__ uint16_t decode_centered_u16(uint16_t packed) {
+    int lo = (int)(int8_t)(packed & 0xffu) + 128;
+    int hi = (int)(int8_t)(packed >> 8) + 128;
+    return (uint16_t)(lo | (hi << 8));
+}
+
 __global__
 void matvec_kernel_dual(uint32_t* result0, uint32_t* result1,
                         const uint16_t* db_rm,
@@ -31,13 +38,14 @@ void matvec_kernel_dual(uint32_t* result0, uint32_t* result1,
 
     uint64_t acc0 = 0, acc1 = 0;
     for (size_t i = 0; i < db_rows; i++) {
-        uint64_t db_val = db_rm[i * db_cols + j];
+        uint64_t db_val = decode_centered_u16(db_rm[i * db_cols + j]);
         acc0 += db_val * query_mod0[i];
         acc1 += db_val * query_mod1[i];
         if ((i & 0xFFF) == 0xFFF) { acc0 %= q0; acc1 %= q1; }
     }
-    result0[j] = (uint32_t)(acc0 % q0);
-    result1[j] = (uint32_t)(acc1 % q1);
+    size_t out = (j / N) * 2 * N + (j % N);
+    result0[out] = (uint32_t)(acc0 % q0);
+    result1[out + N] = (uint32_t)(acc1 % q1);
 }
 
 
@@ -58,7 +66,7 @@ void matvec_kernel_dual_par(uint32_t* partials0, uint32_t* partials1,
 
     uint64_t acc0 = 0, acc1 = 0;
     for (size_t i = row_start; i < row_end; i++) {
-        uint64_t db_val = db_rm[i * db_cols + j];
+        uint64_t db_val = decode_centered_u16(db_rm[i * db_cols + j]);
         acc0 += db_val * query_mod0[i];
         acc1 += db_val * query_mod1[i];
         if ((i & 0xFFF) == 0xFFF) { acc0 %= q0; acc1 %= q1; }
@@ -80,8 +88,9 @@ void matvec_reduce2_kernel(uint32_t* result0, uint32_t* result1,
         s0 += partials0[b * db_cols + j];
         s1 += partials1[b * db_cols + j];
     }
-    result0[j] = (uint32_t)(s0 % q0);
-    result1[j] = (uint32_t)(s1 % q1);
+    size_t out = (j / N) * 2 * N + (j % N);
+    result0[out] = (uint32_t)(s0 % q0);
+    result1[out + N] = (uint32_t)(s1 % q1);
 }
 
 
@@ -121,7 +130,7 @@ void matvec_kernel_dual_batched(uint32_t* const* results0, uint32_t* const* resu
     for (int b = 0; b < BT; b++) { acc0[b] = 0; acc1[b] = 0; }
 
     for (size_t i = 0; i < db_rows; i++) {
-        uint64_t db_val = db_rm[i * db_cols + j];
+        uint64_t db_val = decode_centered_u16(db_rm[i * db_cols + j]);
         #pragma unroll
         for (int b = 0; b < BT; b++) {
             acc0[b] += db_val * qp0[b][i];
@@ -135,8 +144,9 @@ void matvec_kernel_dual_batched(uint32_t* const* results0, uint32_t* const* resu
     #pragma unroll
     for (int b = 0; b < BT; b++) {
         if (b < batch) {
-            results0[b][j] = (uint32_t)(acc0[b] % q0);
-            results1[b][j] = (uint32_t)(acc1[b] % q1);
+            size_t out = (j / N) * 2 * N + (j % N);
+            results0[b][out] = (uint32_t)(acc0[b] % q0);
+            results1[b][out + N] = (uint32_t)(acc1[b] % q1);
         }
     }
 }

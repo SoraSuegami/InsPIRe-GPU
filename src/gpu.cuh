@@ -235,7 +235,8 @@ void gpu_matvec_tensor_batched(
     size_t db_rows, size_t db_cols, uint32_t q0, uint32_t q1,
     int batch, bool interleaved_rns_output, cublasHandle_t handle);
 
-// Dual-limb mat-vec: reads u16 DB once, computes both RNS limbs in one pass.
+// Dual-limb small-batch path: decodes the in-place centered-byte DB and writes
+// directly to interleaved packed-polynomial storage.
 // Dispatches between a "wide" simple kernel (db_cols >> db_rows) and a tall
 // parallel-reduction kernel that splits rows into row blocks.
 void gpu_matvec_dual(uint32_t* d_result0, uint32_t* d_result1,
@@ -244,7 +245,7 @@ void gpu_matvec_dual(uint32_t* d_result0, uint32_t* d_result1,
                      size_t db_rows, size_t db_cols,
                      uint32_t q0, uint32_t q1);
 
-// Batched dual-limb mat-vec: `batch` queries share the DB stream (register
+// Batched centered-DB path: `batch` queries share the DB stream (register
 // tiles of up to 8 per launch; larger batches loop in chunks). All pointer
 // arrays are DEVICE-resident arrays of device pointers, entry b = query b's
 // vector / result buffer. Bit-identical per query to gpu_matvec_dual.

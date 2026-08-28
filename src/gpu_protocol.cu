@@ -1255,12 +1255,19 @@ static std::vector<RlweCt> answer_one(GpuServerCtx* ctx, QuerySlot& slot,
     if (!skip_matvec) {
         upload_query_b(ctx, slot, qry);
         // Phase 14: DB is row-major u16; the dual-limb matvec reads it directly.
-        inspire::gpu::gpu_matvec_tensor_batched(
-            ctx->d_mv_r0_ptrs, ctx->d_mv_r1_ptrs,
-            ctx->d_db_rm, ctx->d_db_byte_sums,
-            ctx->d_mv_q0_ptrs, ctx->d_mv_q1_ptrs,
-            ctx->d_mv_query_planes, ctx->d_mv_query_sums, ctx->d_mv_gemm_out,
-            pp.db_rows, pp.db_cols, Q0, Q1, 1, true, ctx->cublas);
+        if (pp.db_cols >= 38400) {
+            inspire::gpu::gpu_matvec_dual(
+                slot.d_packed_b, slot.d_packed_b,
+                ctx->d_db_rm, slot.d_query_b_q0, slot.d_query_b_q1,
+                pp.db_rows, pp.db_cols, Q0, Q1);
+        } else {
+            inspire::gpu::gpu_matvec_tensor_batched(
+                ctx->d_mv_r0_ptrs, ctx->d_mv_r1_ptrs,
+                ctx->d_db_rm, ctx->d_db_byte_sums,
+                ctx->d_mv_q0_ptrs, ctx->d_mv_q1_ptrs,
+                ctx->d_mv_query_planes, ctx->d_mv_query_sums, ctx->d_mv_gemm_out,
+                pp.db_rows, pp.db_cols, Q0, Q1, 1, true, ctx->cublas);
+        }
         mark("mat-vec");
     }
 
@@ -1526,12 +1533,19 @@ gpu_answer_batch(GpuServerCtx* ctx, const QueryMessage* queries, size_t count) {
     // The DB is streamed once for every geometry; there is no tall fallback.
     for (size_t i = 0; i < count; i++)
         upload_query_b(ctx, ctx->slots[i], queries[i]);
-    inspire::gpu::gpu_matvec_tensor_batched(
-        ctx->d_mv_r0_ptrs, ctx->d_mv_r1_ptrs,
-        ctx->d_db_rm, ctx->d_db_byte_sums,
-        ctx->d_mv_q0_ptrs, ctx->d_mv_q1_ptrs,
-        ctx->d_mv_query_planes, ctx->d_mv_query_sums, ctx->d_mv_gemm_out,
-        ctx->pp.db_rows, ctx->pp.db_cols, Q0, Q1, (int)count, true, ctx->cublas);
+    if (count <= 2 && ctx->pp.db_cols >= 38400) {
+        inspire::gpu::gpu_matvec_dual_batched(
+            ctx->d_mv_r0_ptrs, ctx->d_mv_r1_ptrs, ctx->d_db_rm,
+            ctx->d_mv_q0_ptrs, ctx->d_mv_q1_ptrs,
+            ctx->pp.db_rows, ctx->pp.db_cols, Q0, Q1, (int)count);
+    } else {
+        inspire::gpu::gpu_matvec_tensor_batched(
+            ctx->d_mv_r0_ptrs, ctx->d_mv_r1_ptrs,
+            ctx->d_db_rm, ctx->d_db_byte_sums,
+            ctx->d_mv_q0_ptrs, ctx->d_mv_q1_ptrs,
+            ctx->d_mv_query_planes, ctx->d_mv_query_sums, ctx->d_mv_gemm_out,
+            ctx->pp.db_rows, ctx->pp.db_cols, Q0, Q1, (int)count, true, ctx->cublas);
+    }
     mark("mat-vec (incl. b upload)");
 
     // Stage 2: batched pack — every group's precomp tensor is streamed once
