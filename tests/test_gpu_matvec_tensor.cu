@@ -32,7 +32,9 @@ int main() {
     const size_t cols = std::getenv("INSPIRE_MATVEC_TEST_COLS")
         ? std::strtoull(std::getenv("INSPIRE_MATVEC_TEST_COLS"), nullptr, 10)
         : 2048;
-    constexpr int batch = 3;
+    const int batch = std::getenv("INSPIRE_MATVEC_TEST_BATCH")
+        ? std::atoi(std::getenv("INSPIRE_MATVEC_TEST_BATCH"))
+        : 3;
 
     std::mt19937_64 rng(0x5090c0deULL);
     std::vector<uint16_t> db(rows * cols);
@@ -104,8 +106,16 @@ int main() {
     CUDA_OK(cudaMemcpy(got1.data(), d_r1, got1.size() * sizeof(uint32_t), cudaMemcpyDeviceToHost));
 
     int failures = 0;
+    const bool sample_only = std::getenv("INSPIRE_MATVEC_TEST_SAMPLE_ONLY") != nullptr;
+    std::vector<size_t> checked_cols;
+    if (sample_only) {
+        checked_cols = {0, 1, 17, cols / 4, cols / 2, cols - 2, cols - 1};
+    } else {
+        checked_cols.resize(cols);
+        for (size_t j = 0; j < cols; j++) checked_cols[j] = j;
+    }
     for (int b = 0; b < batch; b++) {
-        for (size_t j = 0; j < cols; j++) {
+        for (size_t j : checked_cols) {
             uint64_t a0 = 0, a1 = 0;
             for (size_t i = 0; i < rows; i++) {
                 uint64_t d = db[i * cols + j];
@@ -133,6 +143,7 @@ int main() {
 
     if (failures) return 1;
     std::cout << "Tensor mat-vec is bit-exact for " << batch
-              << " queries x " << cols << " outputs." << std::endl;
+              << " queries x " << checked_cols.size() << '/' << cols
+              << " checked outputs." << std::endl;
     return 0;
 }
