@@ -151,12 +151,14 @@ void matvec_kernel_dual_batched(uint32_t* const* results0, uint32_t* const* resu
     }
 }
 
-void gpu_matvec_dual_batched(uint32_t* const* d_results0, uint32_t* const* d_results1,
-                             const uint16_t* d_db_rm,
+void gpu_matvec_centered_packed_batched(
+                             uint32_t* const* d_results0, uint32_t* const* d_results1,
+                             const int8_t* d_centered_db_bytes,
                              const uint32_t* const* d_queries0,
                              const uint32_t* const* d_queries1,
                              size_t db_rows, size_t db_cols,
                              uint32_t q0, uint32_t q1, int batch) {
+    const auto* d_db_rm = reinterpret_cast<const uint16_t*>(d_centered_db_bytes);
     size_t threads = 256;
     size_t blocks = (db_cols + threads - 1) / threads;
 
@@ -174,14 +176,6 @@ void gpu_matvec_dual_batched(uint32_t* const* d_results0, uint32_t* const* d_res
             matvec_kernel_dual_batched<2><<<blocks, threads>>>(
                 r0, r1, d_db_rm, s0, s1, db_rows, db_cols, q0, q1, chunk);
     }
-}
-
-// The batched kernel is only profitable when one-thread-per-column fills the
-// GPU on its own (same condition as gpu_matvec_dual's simple path). Tall
-// narrow geometries need the row-split kernel, which the batched path does
-// not implement; the caller falls back to per-query gpu_matvec_dual there.
-bool gpu_matvec_batched_profitable(size_t db_cols) {
-    return (db_cols + 255) / 256 >= 150;
 }
 
 // ============================================================
@@ -226,12 +220,13 @@ void ext_prod_acc_kernel(
 }
 
 
-void gpu_matvec_dual(uint32_t* d_result0, uint32_t* d_result1,
-                     const uint16_t* d_db_rm,
-                     const uint32_t* d_query_mod0, const uint32_t* d_query_mod1,
-                     size_t db_rows, size_t db_cols,
-                     uint32_t q0, uint32_t q1,
-                     uint32_t* d_partials0, uint32_t* d_partials1) {
+void gpu_matvec_centered_packed(uint32_t* d_result0, uint32_t* d_result1,
+                               const int8_t* d_centered_db_bytes,
+                               const uint32_t* d_query_mod0, const uint32_t* d_query_mod1,
+                               size_t db_rows, size_t db_cols,
+                               uint32_t q0, uint32_t q1,
+                               uint32_t* d_partials0, uint32_t* d_partials1) {
+    const auto* d_db_rm = reinterpret_cast<const uint16_t*>(d_centered_db_bytes);
     size_t threads = 256;
 
     // Use the simple one-thread-per-column kernel whenever there are enough

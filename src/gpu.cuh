@@ -227,6 +227,9 @@ void gpu_matvec_tensor_prepare_db(uint16_t* d_db_rm, int32_t* d_byte_sums,
 // both RNS limbs.  Each uint32 query residue is decomposed into four centered
 // byte planes; the correction/recomposition kernel writes ordinary q0/q1
 // results, bit-exact with the scalar modular dot product.
+// The worst centered product is (-128)*(-128)=16384, hence an int32 GEMM
+// accumulator is exact only through floor(INT32_MAX/16384) rows.
+constexpr size_t TENSOR_MATVEC_MAX_ROWS = 131071;
 void gpu_matvec_tensor_batched(
     uint32_t* const* d_results0, uint32_t* const* d_results1,
     const uint16_t* d_centered_db, const int32_t* d_db_byte_sums,
@@ -239,27 +242,25 @@ void gpu_matvec_tensor_batched(
 // directly to interleaved packed-polynomial storage.
 // Dispatches between a "wide" simple kernel (db_cols >> db_rows) and a tall
 // parallel-reduction kernel that splits rows into row blocks.
-void gpu_matvec_dual(uint32_t* d_result0, uint32_t* d_result1,
-                     const uint16_t* d_db_rm,
-                     const uint32_t* d_query_mod0, const uint32_t* d_query_mod1,
-                     size_t db_rows, size_t db_cols,
-                     uint32_t q0, uint32_t q1,
-                     uint32_t* d_partials0, uint32_t* d_partials1);
+void gpu_matvec_centered_packed(uint32_t* d_result0, uint32_t* d_result1,
+                               const int8_t* d_centered_db_bytes,
+                               const uint32_t* d_query_mod0, const uint32_t* d_query_mod1,
+                               size_t db_rows, size_t db_cols,
+                               uint32_t q0, uint32_t q1,
+                               uint32_t* d_partials0, uint32_t* d_partials1);
 
 // Batched centered-DB path: `batch` queries share the DB stream (register
-// tiles of up to 8 per launch; larger batches loop in chunks). All pointer
+// tiles of up to 4 per launch; larger batches loop in chunks). All pointer
 // arrays are DEVICE-resident arrays of device pointers, entry b = query b's
-// vector / result buffer. Bit-identical per query to gpu_matvec_dual.
-void gpu_matvec_dual_batched(uint32_t* const* d_results0, uint32_t* const* d_results1,
-                             const uint16_t* d_db_rm,
+// vector / result buffer. Bit-identical per query to
+// gpu_matvec_centered_packed.
+void gpu_matvec_centered_packed_batched(
+                             uint32_t* const* d_results0, uint32_t* const* d_results1,
+                             const int8_t* d_centered_db_bytes,
                              const uint32_t* const* d_queries0,
                              const uint32_t* const* d_queries1,
                              size_t db_rows, size_t db_cols,
                              uint32_t q0, uint32_t q1, int batch);
-
-// Whether the batched matvec beats per-query row-split dispatch for this
-// geometry (wide enough for one-thread-per-column occupancy).
-bool gpu_matvec_batched_profitable(size_t db_cols);
 
 // Batched lazy collapse: `batch` queries share one stream over the group's
 // precomp tensor D_all; keys / b polys / partials are per query via

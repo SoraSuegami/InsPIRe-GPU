@@ -159,6 +159,12 @@ void gpu_matvec_tensor_batched(
     int8_t* d_query_planes, int32_t* d_query_sums, int32_t* d_gemm_out,
     size_t db_rows, size_t db_cols, uint32_t q0, uint32_t q1,
     int batch, bool interleaved_rns_output, cublasHandle_t handle) {
+    if (db_rows > TENSOR_MATVEC_MAX_ROWS) {
+        std::fprintf(stderr,
+                     "gpu_matvec_tensor_batched: db_rows=%zu exceeds exact INT8 limit %zu\n",
+                     db_rows, TENSOR_MATVEC_MAX_ROWS);
+        std::exit(1);
+    }
     const int plane_cols = batch * 8;
     const size_t threads = 256;
     dim3 qgrid((db_rows + threads - 1) / threads, plane_cols);

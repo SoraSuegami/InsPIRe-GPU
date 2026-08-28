@@ -981,14 +981,16 @@ GpuServerCtx* gpu_setup_server(const PublicParams& pp, const PreprocessData& pre
         CUDA_CHECK(cudaMemcpy((void*)ctx->d_mv_r0_ptrs, r0.data(), pb, cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy((void*)ctx->d_mv_r1_ptrs, r1.data(), pb, cudaMemcpyHostToDevice));
 
-        // One query contributes four byte planes for each of two RNS limbs.
-        // GEMM output is [plane-column][interleaved DB byte/output column].
-        CUDA_CHECK(cudaMalloc(&ctx->d_mv_query_planes,
-                              cfg.max_batch * 8 * pp.db_rows * sizeof(int8_t)));
-        CUDA_CHECK(cudaMalloc(&ctx->d_mv_query_sums,
-                              cfg.max_batch * 8 * sizeof(int32_t)));
-        CUDA_CHECK(cudaMalloc(&ctx->d_mv_gemm_out,
-                              cfg.max_batch * 8 * 2 * pp.db_cols * sizeof(int32_t)));
+        if (pp.db_rows <= inspire::gpu::TENSOR_MATVEC_MAX_ROWS) {
+            // One query contributes four byte planes for each of two RNS limbs.
+            // GEMM output is [plane-column][interleaved DB byte/output column].
+            CUDA_CHECK(cudaMalloc(&ctx->d_mv_query_planes,
+                                  cfg.max_batch * 8 * pp.db_rows * sizeof(int8_t)));
+            CUDA_CHECK(cudaMalloc(&ctx->d_mv_query_sums,
+                                  cfg.max_batch * 8 * sizeof(int32_t)));
+            CUDA_CHECK(cudaMalloc(&ctx->d_mv_gemm_out,
+                                  cfg.max_batch * 8 * 2 * pp.db_cols * sizeof(int32_t)));
+        }
 
         const size_t col_blocks = (pp.db_cols + 255) / 256;
         if (col_blocks < 150 && !(pp.db_cols >= 8192 && pp.db_rows <= 8192)) {
@@ -1013,6 +1015,12 @@ GpuServerCtx* gpu_setup_server(const PublicParams& pp, const PreprocessData& pre
                               + 6 * (2 * D_EFF * N)
                               + (pp.n_packed * 2 * N)
                               + 4 * (2 * N) + 4 * N + 4 * D_EFF * N;
+        const size_t tensor_scratch =
+            pp.db_rows <= inspire::gpu::TENSOR_MATVEC_MAX_ROWS
+            ? cfg.max_batch * 8 * pp.db_rows * sizeof(int8_t)
+              + cfg.max_batch * 8 * sizeof(int32_t)
+              + cfg.max_batch * 8 * 2 * pp.db_cols * sizeof(int32_t)
+            : 0;
         ctx->resident_bytes =
               (size_t)pp.db_rows * pp.db_cols * sizeof(uint16_t)      // encoded DB
             + pp.n_packed * per_group * sizeof(uint32_t)              // precomp
@@ -1021,9 +1029,7 @@ GpuServerCtx* gpu_setup_server(const PublicParams& pp, const PreprocessData& pre
             + 2 * (n_steps_bk * N) * sizeof(uint32_t)                 // perm tables
             + 4 * N * sizeof(uint32_t)                                // twiddles
             + 2 * pp.db_cols * sizeof(int32_t)                        // centered DB sums
-            + cfg.max_batch * 8 * pp.db_rows * sizeof(int8_t)         // query byte planes
-            + cfg.max_batch * 8 * sizeof(int32_t)                     // query-plane sums
-            + cfg.max_batch * 8 * 2 * pp.db_cols * sizeof(int32_t)    // tensor GEMM output
+            + tensor_scratch
             + 2 * ctx->mv_tall_partial_count * sizeof(uint32_t);      // reusable tall scratch
     }
 
@@ -1272,9 +1278,10 @@ static std::vector<RlweCt> answer_one(GpuServerCtx* ctx, QuerySlot& slot,
         upload_query_b(ctx, slot, qry);
         // Phase 14: DB is row-major u16; the dual-limb matvec reads it directly.
         if (pp.db_rows >= 32768) {
-            inspire::gpu::gpu_matvec_dual(
+            inspire::gpu::gpu_matvec_centered_packed(
                 slot.d_packed_b, slot.d_packed_b,
-                ctx->d_db_rm, slot.d_query_b_q0, slot.d_query_b_q1,
+                reinterpret_cast<const int8_t*>(ctx->d_db_rm),
+                slot.d_query_b_q0, slot.d_query_b_q1,
                 pp.db_rows, pp.db_cols, Q0, Q1,
                 ctx->d_mv_tall_partials0, ctx->d_mv_tall_partials1);
         } else {
@@ -1546,23 +1553,31 @@ gpu_answer_batch(GpuServerCtx* ctx, const QueryMessage* queries, size_t count) {
         phase_t0 = t1;
     };
 
-    // Stage 1: one tensor-core GEMM for all query byte planes and both limbs.
-    // The DB is streamed once for every geometry; there is no tall fallback.
+    // Stage 1: small batches use the scalar kernels; larger batches use one
+    // tensor-core GEMM when its int32 accumulation bound is safe. Oversized
+    // custom row geometries fall back to exact 64-bit scalar accumulation.
     for (size_t i = 0; i < count; i++)
         upload_query_b(ctx, ctx->slots[i], queries[i]);
     if (count <= 2 && ctx->pp.db_cols >= 38400) {
-        inspire::gpu::gpu_matvec_dual_batched(
-            ctx->d_mv_r0_ptrs, ctx->d_mv_r1_ptrs, ctx->d_db_rm,
+        inspire::gpu::gpu_matvec_centered_packed_batched(
+            ctx->d_mv_r0_ptrs, ctx->d_mv_r1_ptrs,
+            reinterpret_cast<const int8_t*>(ctx->d_db_rm),
             ctx->d_mv_q0_ptrs, ctx->d_mv_q1_ptrs,
             ctx->pp.db_rows, ctx->pp.db_cols, Q0, Q1, (int)count);
     } else if (count <= 2 && ctx->pp.db_rows >= 32768) {
         for (size_t i = 0; i < count; i++)
-            inspire::gpu::gpu_matvec_dual(
+            inspire::gpu::gpu_matvec_centered_packed(
                 ctx->slots[i].d_packed_b, ctx->slots[i].d_packed_b,
-                ctx->d_db_rm,
+                reinterpret_cast<const int8_t*>(ctx->d_db_rm),
                 ctx->slots[i].d_query_b_q0, ctx->slots[i].d_query_b_q1,
                 ctx->pp.db_rows, ctx->pp.db_cols, Q0, Q1,
                 ctx->d_mv_tall_partials0, ctx->d_mv_tall_partials1);
+    } else if (ctx->pp.db_rows > inspire::gpu::TENSOR_MATVEC_MAX_ROWS) {
+        inspire::gpu::gpu_matvec_centered_packed_batched(
+            ctx->d_mv_r0_ptrs, ctx->d_mv_r1_ptrs,
+            reinterpret_cast<const int8_t*>(ctx->d_db_rm),
+            ctx->d_mv_q0_ptrs, ctx->d_mv_q1_ptrs,
+            ctx->pp.db_rows, ctx->pp.db_cols, Q0, Q1, (int)count);
     } else {
         inspire::gpu::gpu_matvec_tensor_batched(
             ctx->d_mv_r0_ptrs, ctx->d_mv_r1_ptrs,
