@@ -230,7 +230,8 @@ void gpu_matvec_dual(uint32_t* d_result0, uint32_t* d_result1,
                      const uint16_t* d_db_rm,
                      const uint32_t* d_query_mod0, const uint32_t* d_query_mod1,
                      size_t db_rows, size_t db_cols,
-                     uint32_t q0, uint32_t q1) {
+                     uint32_t q0, uint32_t q1,
+                     uint32_t* d_partials0, uint32_t* d_partials1) {
     size_t threads = 256;
 
     // Use the simple one-thread-per-column kernel whenever there are enough
@@ -254,20 +255,17 @@ void gpu_matvec_dual(uint32_t* d_result0, uint32_t* d_result1,
         if (rows_per_block < 64) rows_per_block = 64;
         size_t n_row_blocks = (db_rows + rows_per_block - 1) / rows_per_block;
 
-        uint32_t *d_p0, *d_p1;
-        CUDA_CHECK(cudaMalloc(&d_p0, n_row_blocks * db_cols * sizeof(uint32_t)));
-        CUDA_CHECK(cudaMalloc(&d_p1, n_row_blocks * db_cols * sizeof(uint32_t)));
+        assert(d_partials0 && d_partials1);
 
         size_t col_blocks = (db_cols + threads - 1) / threads;
         dim3 grid(col_blocks, n_row_blocks);
-        matvec_kernel_dual_par<<<grid, threads>>>(d_p0, d_p1, d_db_rm,
+        matvec_kernel_dual_par<<<grid, threads>>>(d_partials0, d_partials1, d_db_rm,
                                                    d_query_mod0, d_query_mod1,
                                                    db_rows, db_cols, q0, q1,
                                                    rows_per_block);
         matvec_reduce2_kernel<<<col_blocks, threads>>>(d_result0, d_result1,
-                                                        d_p0, d_p1, db_cols,
+                                                        d_partials0, d_partials1, db_cols,
                                                         n_row_blocks, q0, q1);
-        cudaFree(d_p0); cudaFree(d_p1);
     }
     CUDA_CHECK(cudaGetLastError());
 }

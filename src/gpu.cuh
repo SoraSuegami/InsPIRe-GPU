@@ -243,7 +243,8 @@ void gpu_matvec_dual(uint32_t* d_result0, uint32_t* d_result1,
                      const uint16_t* d_db_rm,
                      const uint32_t* d_query_mod0, const uint32_t* d_query_mod1,
                      size_t db_rows, size_t db_cols,
-                     uint32_t q0, uint32_t q1);
+                     uint32_t q0, uint32_t q1,
+                     uint32_t* d_partials0, uint32_t* d_partials1);
 
 // Batched centered-DB path: `batch` queries share the DB stream (register
 // tiles of up to 8 per launch; larger batches loop in chunks). All pointer

@@ -124,6 +124,9 @@ struct GpuServerCtx {
     int8_t* d_mv_query_planes = nullptr; // max_batch*8*db_rows
     int32_t* d_mv_query_sums = nullptr;  // max_batch*8
     int32_t* d_mv_gemm_out = nullptr;    // max_batch*8*2*db_cols
+    uint32_t* d_mv_tall_partials0 = nullptr;
+    uint32_t* d_mv_tall_partials1 = nullptr;
+    size_t mv_tall_partial_count = 0;
 
     // Permutation tables (shared, derived from CRS at setup time)
     uint32_t* d_perm_fwd;   // (n/2-1) × N uint32
@@ -986,6 +989,18 @@ GpuServerCtx* gpu_setup_server(const PublicParams& pp, const PreprocessData& pre
                               cfg.max_batch * 8 * sizeof(int32_t)));
         CUDA_CHECK(cudaMalloc(&ctx->d_mv_gemm_out,
                               cfg.max_batch * 8 * 2 * pp.db_cols * sizeof(int32_t)));
+
+        const size_t col_blocks = (pp.db_cols + 255) / 256;
+        if (col_blocks < 150 && !(pp.db_cols >= 8192 && pp.db_rows <= 8192)) {
+            size_t rows_per_block = (pp.db_rows + 255) / 256;
+            if (rows_per_block < 64) rows_per_block = 64;
+            const size_t row_blocks = (pp.db_rows + rows_per_block - 1) / rows_per_block;
+            ctx->mv_tall_partial_count = row_blocks * pp.db_cols;
+            CUDA_CHECK(cudaMalloc(&ctx->d_mv_tall_partials0,
+                                  ctx->mv_tall_partial_count * sizeof(uint32_t)));
+            CUDA_CHECK(cudaMalloc(&ctx->d_mv_tall_partials1,
+                                  ctx->mv_tall_partial_count * sizeof(uint32_t)));
+        }
     }
 
     // Resident-memory bookkeeping for gpu_server_caps.
@@ -1008,7 +1023,8 @@ GpuServerCtx* gpu_setup_server(const PublicParams& pp, const PreprocessData& pre
             + 2 * pp.db_cols * sizeof(int32_t)                        // centered DB sums
             + cfg.max_batch * 8 * pp.db_rows * sizeof(int8_t)         // query byte planes
             + cfg.max_batch * 8 * sizeof(int32_t)                     // query-plane sums
-            + cfg.max_batch * 8 * 2 * pp.db_cols * sizeof(int32_t);   // tensor GEMM output
+            + cfg.max_batch * 8 * 2 * pp.db_cols * sizeof(int32_t)    // tensor GEMM output
+            + 2 * ctx->mv_tall_partial_count * sizeof(uint32_t);      // reusable tall scratch
     }
 
     // Per-group streams (capped at 32 to avoid GPU oversubscription).
@@ -1255,11 +1271,12 @@ static std::vector<RlweCt> answer_one(GpuServerCtx* ctx, QuerySlot& slot,
     if (!skip_matvec) {
         upload_query_b(ctx, slot, qry);
         // Phase 14: DB is row-major u16; the dual-limb matvec reads it directly.
-        if (pp.db_cols >= 38400) {
+        if (pp.db_rows >= 32768) {
             inspire::gpu::gpu_matvec_dual(
                 slot.d_packed_b, slot.d_packed_b,
                 ctx->d_db_rm, slot.d_query_b_q0, slot.d_query_b_q1,
-                pp.db_rows, pp.db_cols, Q0, Q1);
+                pp.db_rows, pp.db_cols, Q0, Q1,
+                ctx->d_mv_tall_partials0, ctx->d_mv_tall_partials1);
         } else {
             inspire::gpu::gpu_matvec_tensor_batched(
                 ctx->d_mv_r0_ptrs, ctx->d_mv_r1_ptrs,
@@ -1538,6 +1555,14 @@ gpu_answer_batch(GpuServerCtx* ctx, const QueryMessage* queries, size_t count) {
             ctx->d_mv_r0_ptrs, ctx->d_mv_r1_ptrs, ctx->d_db_rm,
             ctx->d_mv_q0_ptrs, ctx->d_mv_q1_ptrs,
             ctx->pp.db_rows, ctx->pp.db_cols, Q0, Q1, (int)count);
+    } else if (count <= 2 && ctx->pp.db_rows >= 32768) {
+        for (size_t i = 0; i < count; i++)
+            inspire::gpu::gpu_matvec_dual(
+                ctx->slots[i].d_packed_b, ctx->slots[i].d_packed_b,
+                ctx->d_db_rm,
+                ctx->slots[i].d_query_b_q0, ctx->slots[i].d_query_b_q1,
+                ctx->pp.db_rows, ctx->pp.db_cols, Q0, Q1,
+                ctx->d_mv_tall_partials0, ctx->d_mv_tall_partials1);
     } else {
         inspire::gpu::gpu_matvec_tensor_batched(
             ctx->d_mv_r0_ptrs, ctx->d_mv_r1_ptrs,
@@ -1632,6 +1657,7 @@ void gpu_free_server(GpuServerCtx* ctx) {
     cudaFree(ctx->d_db_byte_sums);
     cudaFree(ctx->d_mv_query_planes); cudaFree(ctx->d_mv_query_sums);
     cudaFree(ctx->d_mv_gemm_out);
+    cudaFree(ctx->d_mv_tall_partials0); cudaFree(ctx->d_mv_tall_partials1);
     cudaFree(ctx->d_perm_fwd); cudaFree(ctx->d_perm_conj);
     for (auto p : ctx->d_precomp_a) cudaFree(p);
     for (auto p : ctx->d_precomp_D_plus) cudaFree(p);
