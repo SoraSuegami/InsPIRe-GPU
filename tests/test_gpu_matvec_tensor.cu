@@ -2,6 +2,7 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 #include <cstdint>
+#include <cstdlib>
 #include <iostream>
 #include <random>
 #include <vector>
@@ -25,8 +26,12 @@
 using namespace inspire::gpu;
 
 int main() {
-    constexpr size_t rows = 2048;
-    constexpr size_t cols = 2048;
+    const size_t rows = std::getenv("INSPIRE_MATVEC_TEST_ROWS")
+        ? std::strtoull(std::getenv("INSPIRE_MATVEC_TEST_ROWS"), nullptr, 10)
+        : 2048;
+    const size_t cols = std::getenv("INSPIRE_MATVEC_TEST_COLS")
+        ? std::strtoull(std::getenv("INSPIRE_MATVEC_TEST_COLS"), nullptr, 10)
+        : 2048;
     constexpr int batch = 3;
 
     std::mt19937_64 rng(0x5090c0deULL);
